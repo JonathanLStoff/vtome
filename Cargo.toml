@@ -1,0 +1,93 @@
+[package]
+name = "vtome"
+version = "0.1.0"
+edition = "2021"
+authors = ["Jonathan Stoff <JonathanLStoff@gmail.com>"]
+description = "Show images and video on a specific monitor — or a specific quadrilateral of one — with royalty-free codecs and no FFmpeg. GPU presentation with perspective-correct corner pinning, optional windowing, and a frame pipeline that stays in YUV until the shader."
+license = "MIT"
+repository = "https://github.com/jonathanlstoff/vtome"
+readme = "README.md"
+keywords = ["video", "av1", "display", "projection", "wgpu"]
+categories = ["multimedia::video", "multimedia::images", "rendering"]
+
+[dependencies]
+thiserror = "2"
+
+# --- Containers -----------------------------------------------------------
+# Demuxing only. Neither of these decodes anything, so they are cheap: pure
+# Rust, no C toolchain.
+mp4 = { version = "0.14", optional = true }
+matroska-demuxer = { version = "0.8", optional = true }
+
+# --- Still images ---------------------------------------------------------
+image = { version = "0.25", optional = true, default-features = false, features = [
+    "png",
+    "jpeg",
+    "gif",
+    "webp",
+    "bmp",
+    "tiff",
+] }
+
+# --- Presentation ---------------------------------------------------------
+# `render` is a GPU and a surface; it does not imply a window. `window` adds
+# one. An application embedding vtome in its own window (Tauri, a game engine)
+# takes `render` + `embed` and never compiles winit.
+wgpu = { version = "30", optional = true }
+bytemuck = { version = "1", optional = true, features = ["derive"] }
+pollster = { version = "0.4", optional = true }
+raw-window-handle = { version = "0.6", optional = true }
+winit = { version = "0.30", optional = true }
+
+# --- Encoding -------------------------------------------------------------
+# rav1e is the reason AV1 is the default target: a pure-Rust AV1 encoder, so a
+# transcode build needs no C toolchain. See planning/TODO.md.
+rav1e = { version = "0.8", optional = true, default-features = false, features = [
+    "threading",
+] }
+webm-iterable = { version = "0.6", optional = true }
+
+[features]
+default = ["demux", "image"]
+
+# Containers in, both pure Rust.
+demux = ["dep:mp4", "dep:matroska-demuxer"]
+
+# Decoders. Each gates a backend; none of them is implied by `demux`, because
+# reading a file's structure and being able to decode its pictures are
+# different capabilities and a build may want only the first.
+decode-av1 = []
+decode-vp9 = []
+decode-platform = []
+all-decoders = ["decode-av1", "decode-vp9", "decode-platform"]
+
+# Encoding, and the container to put it in.
+encode-av1 = ["dep:rav1e"]
+encode-vp9 = []
+mux = ["dep:webm-iterable"]
+transcode = ["demux", "mux", "encode-av1"]
+
+# Presentation.
+render = ["dep:wgpu", "dep:bytemuck", "dep:pollster", "dep:raw-window-handle"]
+embed = ["render"]
+window = ["render", "dep:winit"]
+
+# Still images.
+image = ["dep:image"]
+
+[dev-dependencies]
+tempfile = "3"
+# The integration tests write their own image fixtures rather than carrying
+# binary files, so the decoder and the fixture can never disagree.
+image = { version = "0.25", default-features = false, features = ["png"] }
+
+[[example]]
+name = "identify"
+
+[[example]]
+name = "corner_pin"
+
+[[example]]
+name = "show"
+required-features = ["window", "image"]
+
