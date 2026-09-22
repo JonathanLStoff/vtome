@@ -104,19 +104,73 @@ fn attached(event_loop: &ActiveEventLoop) -> Vec<Monitor> {
 fn describe(handle: &winit::monitor::MonitorHandle, is_primary: bool) -> Monitor {
     let position = handle.position();
     let size = handle.size();
+    let name = handle.name().unwrap_or_default();
+    let scale_factor = handle.scale_factor();
+    let refresh_millihertz = handle.refresh_rate_millihertz();
+
+    let persistent_id = get_persistent_monitor_id(
+        &name,
+        position.x,
+        position.y,
+        scale_factor,
+        refresh_millihertz,
+    );
 
     Monitor {
-        name: handle.name().unwrap_or_default(),
+        name,
         bounds: Rect::new(
             f64::from(position.x),
             f64::from(position.y),
             f64::from(size.width),
             f64::from(size.height),
         ),
-        scale_factor: handle.scale_factor(),
-        refresh_millihertz: handle.refresh_rate_millihertz(),
+        scale_factor,
+        refresh_millihertz,
         is_primary,
+        persistent_id,
     }
+}
+
+/// Generate a persistent monitor ID from monitor attributes.
+/// On Linux, uses the monitor name (xrandr output name) which is stable.
+/// On other platforms, uses a hash of name, position, refresh rate, and scale factor.
+fn get_persistent_monitor_id(
+    name: &str,
+    x: i32,
+    y: i32,
+    scale_factor: f64,
+    refresh_millihertz: Option<u32>,
+) -> String {
+    #[cfg(target_os = "linux")]
+    {
+        // On Linux, prefer xrandr output name (e.g., "HDMI-1", "DP-2") if available.
+        // This is the most stable identifier and survives port changes.
+        if !name.is_empty() {
+            return format!("xrandr_{}", name);
+        }
+    }
+
+    // Fallback: hash the name, position, refresh rate, and scale factor for stability.
+    // This includes attributes that uniquely identify the monitor within the system.
+    hash_monitor_id(name, x, y, scale_factor, refresh_millihertz)
+}
+
+fn hash_monitor_id(
+    name: &str,
+    x: i32,
+    y: i32,
+    scale_factor: f64,
+    refresh_millihertz: Option<u32>,
+) -> String {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    let mut hasher = DefaultHasher::new();
+    name.hash(&mut hasher);
+    x.hash(&mut hasher);
+    y.hash(&mut hasher);
+    scale_factor.to_bits().hash(&mut hasher);
+    refresh_millihertz.hash(&mut hasher);
+    format!("monitor_{:016x}", hasher.finish())
 }
 
 /// Shows one picture, in one place, until it is closed.

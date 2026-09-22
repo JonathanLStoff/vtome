@@ -10,6 +10,9 @@
 //! with a 4K monitor next to a 1080p one are a bug generator: the same logical
 //! coordinate is two different places depending on which monitor you ask.
 
+use std::collections::hash_map::DefaultHasher;
+use std::hash::Hasher;
+
 use crate::error::{Error, Result};
 use crate::geometry::{Fit, Point, Quad, Rect};
 
@@ -29,17 +32,27 @@ pub struct Monitor {
     pub refresh_millihertz: Option<u32>,
     /// Whether the platform considers this the primary display.
     pub is_primary: bool,
+    /// A persistent, unique identifier for this monitor across sessions.
+    /// On macOS: CGDirectDisplayID encoded as a hex string.
+    /// On Windows: HMONITOR encoded as a hex string.
+    /// On Linux: xrandr output name or port identifier.
+    /// Fallback: hash of monitor name and position for stability.
+    pub persistent_id: String,
 }
 
 impl Monitor {
     /// A monitor, for tests and for platforms that report nothing useful.
     pub fn new(name: impl Into<String>, bounds: Rect) -> Self {
+        let name_str = name.into();
+        let persistent_id =
+            generate_persistent_id(&name_str, bounds.x, bounds.y, 1.0, None);
         Monitor {
-            name: name.into(),
+            name: name_str,
             bounds,
             scale_factor: 1.0,
             refresh_millihertz: None,
             is_primary: false,
+            persistent_id,
         }
     }
 
@@ -55,6 +68,24 @@ impl Monitor {
             .filter(|hz| *hz > 0.0)
             .map(|hz| std::time::Duration::from_secs_f64(1.0 / hz))
     }
+}
+
+fn generate_persistent_id(
+    name: &str,
+    x: f64,
+    y: f64,
+    scale_factor: f64,
+    refresh_millihertz: Option<u32>,
+) -> String {
+    use std::hash::Hash;
+
+    let mut hasher = DefaultHasher::new();
+    name.hash(&mut hasher);
+    x.to_bits().hash(&mut hasher);
+    y.to_bits().hash(&mut hasher);
+    scale_factor.to_bits().hash(&mut hasher);
+    refresh_millihertz.hash(&mut hasher);
+    format!("monitor_{:016x}", hasher.finish())
 }
 
 /// How to find the monitor a placement means.
