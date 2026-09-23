@@ -1,6 +1,6 @@
 [package]
 name = "vtome"
-version = "0.2.1"
+version = "0.2.2"
 edition = "2021"
 authors = ["Jonathan Stoff <JonathanLStoff@gmail.com>"]
 description = "Show images and video on a specific monitor — or a specific quadrilateral of one — with royalty-free codecs and no FFmpeg. GPU presentation with perspective-correct corner pinning, optional windowing, and a frame pipeline that stays in YUV until the shader."
@@ -52,6 +52,8 @@ default = ["demux", "image"]
 
 # Containers in, both pure Rust.
 demux = ["dep:mp4", "dep:matroska-demuxer"]
+# Alias for demux, used by the publish workflow.
+import = ["demux"]
 
 # Decoders. Each gates a backend; none of them is implied by `demux`, because
 # reading a file's structure and being able to decode its pictures are
