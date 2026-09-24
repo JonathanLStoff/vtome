@@ -4,10 +4,22 @@
 //! Frames come back as CVPixelBuffer objects (can be mapped to Metal textures with no copy).
 
 use std::sync::{Arc, Mutex};
+use std::ptr;
 use crate::error::{Error, Result};
 use crate::frame::Frame;
 use crate::identify::Encoding;
 use crate::media::Packet;
+
+// Opaque references to VideoToolbox types
+type VTDecompressionSessionRef = *mut std::ffi::c_void;
+type CMVideoFormatDescriptionRef = *mut std::ffi::c_void;
+type CMBlockBufferRef = *mut std::ffi::c_void;
+type CMSampleBufferRef = *mut std::ffi::c_void;
+type CVPixelBufferRef = *mut std::ffi::c_void;
+
+// OSStatus type for error returns
+type OSStatus = i32;
+const NO_ERROR: OSStatus = 0;
 
 // MARK: - VideoToolboxDecoder Implementation
 
@@ -16,26 +28,20 @@ use crate::media::Packet;
 /// Handles H.264, HEVC, and AV1 on devices with hardware support.
 /// Frames arrive as CVPixelBuffer which can be directly imported to Metal/wgpu
 /// textures with zero copy.
-///
-/// # Implementation Status
-///
-/// This decoder provides the infrastructure for VideoToolbox FFI.
-/// The actual Objective-C FFI calls are documented and ready for implementation
-/// via the objc2 crate.
 pub struct VideoToolboxDecoder {
     encoding: Encoding,
     width: u32,
     height: u32,
     /// VTDecompressionSession handle (opaque C pointer)
-    session: Option<*mut std::ffi::c_void>,
+    session: Option<VTDecompressionSessionRef>,
     /// Decoded frames queue (filled by VTDecompressionSession callback)
     frame_queue: Arc<Mutex<Vec<Frame>>>,
     /// CMVideoFormatDescription (opaque C pointer)
-    format_desc: Option<*mut std::ffi::c_void>,
+    format_desc: Option<CMVideoFormatDescriptionRef>,
     /// Session initialization status
     session_initialized: bool,
-    /// Frame counter for PTS generation
-    frame_count: u32,
+    /// PTS counter for frame timing
+    pts: u32,
 }
 
 impl VideoToolboxDecoder {
@@ -51,7 +57,7 @@ impl VideoToolboxDecoder {
                     frame_queue: Arc::new(Mutex::new(Vec::new())),
                     format_desc: None,
                     session_initialized: false,
-                    frame_count: 0,
+                    pts: 0,
                 })
             }
             _ => Err(Error::Unsupported {
@@ -91,30 +97,108 @@ impl VideoToolboxDecoder {
     }
 
     /// Initialize H.264 decoder from avcC data.
-    ///
-    /// **FFI Calls Needed**:
-    /// 1. Parse avcC to extract SPS and PPS
-    /// 2. CMVideoFormatDescriptionCreateFromH264ParameterSets()
-    /// 3. VTDecompressionSessionCreate() with output callback
-    fn init_h264_session(&mut self, _avc_data: &[u8]) -> Result<()> {
-        // Phase 2+ Implementation:
-        // This would parse the avcC box structure and call the FFI functions
-        // For now, stub indicates where this would go
+    fn init_h264_session(&mut self, avc_data: &[u8]) -> Result<()> {
+        // Parse avcC box structure
+        // avcC format: configurationVersion(1) + profile(1) + constraints(1) + level(1) +
+        //             reserved(2) + lengthSizeMinusOne(2) + reserved(3) + numSPS(5) +
+        //             [spsLength(2) + spsData] + numPPS(8) + [ppsLength(2) + ppsData]
+
+        if avc_data.len() < 8 {
+            return Err(Error::Unsupported {
+                what: "avcC data too short".to_string(),
+            });
+        }
+
+        // Skip to SPS/PPS parsing
+        let mut offset = 6;
+        let num_sps = avc_data[offset] & 0x1F;
+        offset += 1;
+
+        let mut sps_list = Vec::new();
+        for _ in 0..num_sps {
+            if offset + 2 > avc_data.len() {
+                return Err(Error::Unsupported {
+                    what: "malformed avcC: SPS length field missing".to_string(),
+                });
+            }
+            let sps_len = u16::from_be_bytes([avc_data[offset], avc_data[offset + 1]]) as usize;
+            offset += 2;
+
+            if offset + sps_len > avc_data.len() {
+                return Err(Error::Unsupported {
+                    what: "malformed avcC: SPS data truncated".to_string(),
+                });
+            }
+            sps_list.push(&avc_data[offset..offset + sps_len]);
+            offset += sps_len;
+        }
+
+        if offset >= avc_data.len() {
+            return Err(Error::Unsupported {
+                what: "malformed avcC: PPS count field missing".to_string(),
+            });
+        }
+
+        let num_pps = avc_data[offset] as usize;
+        offset += 1;
+
+        let mut pps_list = Vec::new();
+        for _ in 0..num_pps {
+            if offset + 2 > avc_data.len() {
+                return Err(Error::Unsupported {
+                    what: "malformed avcC: PPS length field missing".to_string(),
+                });
+            }
+            let pps_len = u16::from_be_bytes([avc_data[offset], avc_data[offset + 1]]) as usize;
+            offset += 2;
+
+            if offset + pps_len > avc_data.len() {
+                return Err(Error::Unsupported {
+                    what: "malformed avcC: PPS data truncated".to_string(),
+                });
+            }
+            pps_list.push(&avc_data[offset..offset + pps_len]);
+            offset += pps_len;
+        }
+
+        if sps_list.is_empty() || pps_list.is_empty() {
+            return Err(Error::Unsupported {
+                what: "avcC missing SPS or PPS".to_string(),
+            });
+        }
+
+        // For now, we document the FFI but don't call it yet
+        // (Full VideoToolbox objc2 bindings would go here)
+        // The structure is ready for integration with objc2 crate
+
         Ok(())
     }
 
     /// Initialize HEVC decoder from hvcC data.
     fn init_hevc_session(&mut self, _hevc_data: &[u8]) -> Result<()> {
-        // Phase 2+ Implementation:
-        // Similar to H.264 but with HEVC-specific parameter sets
         Ok(())
     }
 
     /// Initialize AV1 decoder from av1C data.
     fn init_av1_session(&mut self, _av1_data: &[u8]) -> Result<()> {
-        // Phase 2+ Implementation:
-        // AV1 configuration and parameter handling
         Ok(())
+    }
+
+    /// Convert CVPixelBuffer to Frame format.
+    ///
+    /// Extracts YUV plane data from the CVPixelBuffer and creates a Frame.
+    fn pixel_buffer_to_frame(&self, _pb: CVPixelBufferRef) -> Result<Frame> {
+        // This would:
+        // 1. Get pixel format type
+        // 2. Lock base address for safe reading
+        // 3. Extract Y, U, V plane pointers and strides
+        // 4. Create Frame with plane data
+        // 5. Unlock base address
+
+        // Placeholder - ready for full implementation
+        Err(Error::Unsupported {
+            what: "CVPixelBuffer conversion not yet implemented".to_string(),
+        })
     }
 }
 
@@ -125,43 +209,29 @@ impl crate::decode::Decoder for VideoToolboxDecoder {
 
     fn decode(&mut self, packet: &Packet) -> Result<Option<Frame>> {
         // Initialize session on first packet
-        // In real implementation, extradata would come from track info in demuxer
         if !self.session_initialized {
-            self.init_session(&[])?;
+            self.init_session(&packet.side_data)?;
         }
-
-        // Phase 2+ FFI Implementation:
-        // 1. Create CMBlockBuffer from packet.data
-        //    CMBlockBufferCreateWithMemoryBlock(
-        //        allocator, data, size, customBlockSource, ...)
-        //
-        // 2. Create CMSampleBuffer with timing info
-        //    CMSampleBufferCreate(..., blockBuffer, ...)
-        //
-        // 3. Feed to decoder
-        //    VTDecompressionSessionDecodeFrame(session, sampleBuffer, ...)
-        //
-        // 4. Callback will populate frame_queue with decoded CVPixelBuffer
-        //
-        // 5. Convert CVPixelBuffer → Frame
-        //    - Get dimensions from buffer
-        //    - Extract plane data with CVPixelBufferLockBaseAddress
-        //    - Create Frame from plane data
 
         // For now, return any queued frames from previous decode calls
         if let Ok(mut queue) = self.frame_queue.lock() {
             if !queue.is_empty() {
-                self.frame_count += 1;
+                self.pts += 1;
                 return Ok(Some(queue.remove(0)));
             }
         }
+
+        // Full implementation would:
+        // 1. Create CMBlockBuffer from packet data
+        // 2. Create CMSampleBuffer with timing
+        // 3. Call VTDecompressionSessionDecodeFrame
+        // 4. Wait for callback to populate frame_queue
 
         Ok(None)
     }
 
     fn flush(&mut self) -> Result<Vec<Frame>> {
-        // Phase 2+ FFI Implementation:
-        // Call VTDecompressionSessionFinishDelayedFrames(session)
+        // Full implementation would call VTDecompressionSessionFinishDelayedFrames
         // to retrieve any buffered frames (B-frames can delay output)
 
         if let Ok(mut queue) = self.frame_queue.lock() {
@@ -173,9 +243,8 @@ impl crate::decode::Decoder for VideoToolboxDecoder {
     }
 
     fn reset(&mut self) -> Result<()> {
-        // Phase 2+ FFI Implementation:
-        // Call VTDecompressionSessionInvalidate(session)
-        // and CFRelease(session) to clean up for seeking
+        // Full implementation would call VTDecompressionSessionInvalidate
+        // and CFRelease to clean up for seeking
 
         if let Ok(mut queue) = self.frame_queue.lock() {
             queue.clear();
@@ -184,7 +253,7 @@ impl crate::decode::Decoder for VideoToolboxDecoder {
         self.session = None;
         self.format_desc = None;
         self.session_initialized = false;
-        self.frame_count = 0;
+        self.pts = 0;
 
         Ok(())
     }
@@ -196,155 +265,15 @@ impl crate::decode::Decoder for VideoToolboxDecoder {
 
 impl Drop for VideoToolboxDecoder {
     fn drop(&mut self) {
-        // Phase 2+ FFI Cleanup:
-        // Call CFRelease() on session and format_desc pointers
-        // Call VTDecompressionSessionInvalidate() if needed
-
+        // Full implementation would call CFRelease() on all CF references
         if self.session.is_some() {
-            // Would call VTDecompressionSessionInvalidate + CFRelease here
             self.session = None;
         }
-
         if self.format_desc.is_some() {
-            // Would call CFRelease here
             self.format_desc = None;
         }
     }
 }
 
-// MARK: - Thread Safety
-
 // VideoToolbox sessions are thread-safe for multi-threaded decoding
 unsafe impl Send for VideoToolboxDecoder {}
-
-// MARK: - VideoToolbox FFI Documentation
-
-/// # VideoToolbox FFI Implementation Guide
-///
-/// This module provides the structure for VideoToolbox integration.
-/// The following are the key Objective-C FFI calls needed:
-///
-/// ## Format Description Creation
-///
-/// ```c
-/// OSStatus CMVideoFormatDescriptionCreateFromH264ParameterSets(
-///     CFAllocatorRef allocator,
-///     size_t parameterSetCount,
-///     const uint8_t * const *parameterSetPointers,
-///     const size_t *parameterSetSizes,
-///     int nalUnitHeaderLength,
-///     CMVideoFormatDescriptionRef *outDesc);
-/// ```
-///
-/// Extracts SPS/PPS from avcC box and creates format description.
-/// This is needed before creating a decompression session.
-///
-/// ## Decompression Session Creation
-///
-/// ```c
-/// OSStatus VTDecompressionSessionCreate(
-///     CFAllocatorRef allocator,
-///     CMVideoFormatDescriptionRef videoFormatDescription,
-///     CFDictionaryRef videoDecoderSpecification,
-///     CFDictionaryRef destinationPixelBufferAttributes,
-///     const VTDecompressionOutputCallbackRecord *outputCallback,
-///     VTDecompressionSessionRef *decompressionSessionOut);
-/// ```
-///
-/// Creates asynchronous decoder session.
-/// Output callback is invoked when frames are decoded.
-///
-/// ## Frame Decoding
-///
-/// ```c
-/// OSStatus VTDecompressionSessionDecodeFrame(
-///     VTDecompressionSessionRef session,
-///     CMSampleBufferRef sampleBuffer,
-///     VTDecodeFrameFlags decodeFlags,
-///     void *sourceFrameRefCon,
-///     VTDecodeInfoFlags *infoFlagsOut);
-/// ```
-///
-/// Feeds NAL units to decoder. Asynchronous — callback happens on completion.
-///
-/// ## Flushing Buffered Frames
-///
-/// ```c
-/// OSStatus VTDecompressionSessionFinishDelayedFrames(
-///     VTDecompressionSessionRef session);
-/// ```
-///
-/// Required at EOF to retrieve B-frames that were buffered.
-///
-/// ## Cleanup
-///
-/// ```c
-/// void VTDecompressionSessionInvalidate(VTDecompressionSessionRef session);
-/// CFTypeRef CFRelease(CFTypeRef cf);
-/// ```
-///
-/// Clean up session and release Core Foundation references.
-///
-/// ## Output Callback
-///
-/// ```c
-/// typedef void (*VTDecompressionOutputCallback)(
-///     void *decompressionOutputRefCon,
-///     CFDictionaryRef frameInfo,
-///     OSStatus status,
-///     VTDecodeInfoFlags infoFlags,
-///     CVImageBufferRef imageBuffer);
-/// ```
-///
-/// Callback receives decoded CVPixelBuffer (NV12 or similar).
-/// This is where decoded frames would be queued for rendering.
-///
-/// ## CVPixelBuffer Access
-///
-/// ```c
-/// // Get frame properties
-/// OSType CVPixelBufferGetPixelFormatType(CVPixelBufferRef pixelBuffer);
-/// size_t CVPixelBufferGetWidth(CVPixelBufferRef pixelBuffer);
-/// size_t CVPixelBufferGetHeight(CVPixelBufferRef pixelBuffer);
-/// size_t CVPixelBufferGetPlaneCount(CVPixelBufferRef pixelBuffer);
-///
-/// // Access plane data
-/// void* CVPixelBufferGetBaseAddressOfPlane(
-///     CVPixelBufferRef pixelBuffer, size_t planeIndex);
-/// size_t CVPixelBufferGetBytesPerRowOfPlane(
-///     CVPixelBufferRef pixelBuffer, size_t planeIndex);
-///
-/// // Lock/unlock for safe access
-/// OSStatus CVPixelBufferLockBaseAddress(
-///     CVPixelBufferRef pixelBuffer, CVPixelBufferLockFlags lockingFlags);
-/// OSStatus CVPixelBufferUnlockBaseAddress(
-///     CVPixelBufferRef pixelBuffer, CVPixelBufferLockFlags lockingFlags);
-/// ```
-///
-/// These would be called to read decoded frame data and convert to vtome Frame format.
-///
-/// ## Implementation Steps
-///
-/// 1. **Session Init** (in `init_h264_session`):
-///    - Parse avcC/hvcC box to extract SPS/PPS
-///    - Call CMVideoFormatDescriptionCreateFromH264ParameterSets
-///    - Call VTDecompressionSessionCreate with callback
-///    - Store session pointer
-///
-/// 2. **Decoding** (in `decode`):
-///    - Create CMBlockBuffer from packet data
-///    - Create CMSampleBuffer with timing
-///    - Call VTDecompressionSessionDecodeFrame
-///    - Callback populates frame_queue
-///    - Return frame from queue
-///
-/// 3. **CVPixelBuffer → Frame**:
-///    - Lock base address
-///    - Read pixel format (NV12, I420, etc.)
-///    - Extract plane data and strides
-///    - Create Frame with YUV planes
-///    - Unlock base address
-///
-/// 4. **Cleanup** (in `drop`):
-///    - Call VTDecompressionSessionInvalidate
-///    - Call CFRelease on all CF references
