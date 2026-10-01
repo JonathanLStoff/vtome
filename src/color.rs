@@ -220,9 +220,72 @@ pub fn convert_pixel(space: ColorSpace, bit_depth: u32, yuv: [f32; 3]) -> [f32; 
     })
 }
 
+/// A colour as a settings file writes it — `#RRGGBBAA` — into straight
+/// (not premultiplied) RGBA, each `0.0..=1.0`.
+///
+/// Also takes `#RRGGBB`, `#RGB`, and `#RGBA`; the short forms repeat each
+/// digit, as CSS does. Missing alpha means opaque. The values are the
+/// display's own, gamma and all — a background colour is drawn as written, not
+/// run through any curve.
+///
+/// # Errors
+///
+/// [`Error::Unsupported`](crate::Error::Unsupported) for anything else, naming
+/// what was given.
+pub fn parse_hex_color(text: &str) -> crate::Result<[f32; 4]> {
+    let refuse = || {
+        crate::Error::Unsupported {
+            what: format!(
+                "{text:?} is not a colour — expected #RRGGBBAA, #RRGGBB, #RGBA, or #RGB"
+            ),
+        }
+    };
+
+    let digits = text.trim().strip_prefix('#').ok_or_else(refuse)?;
+
+    if !digits.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(refuse());
+    }
+
+    // Widened to eight digits, so there is one parse below.
+    let full: String = match digits.len() {
+        3 | 4 => digits.chars().flat_map(|digit| [digit, digit]).collect(),
+        6 | 8 => digits.to_string(),
+        _ => return Err(refuse()),
+    };
+
+    let channel = |index: usize| -> crate::Result<f32> {
+        full.get(index * 2..index * 2 + 2)
+            .map_or(Ok(255), |pair| u8::from_str_radix(pair, 16).map_err(|_| refuse()))
+            .map(|value| f32::from(value) / 255.0)
+    };
+
+    Ok([channel(0)?, channel(1)?, channel(2)?, channel(3)?])
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn hex_colours_parse_in_every_form_a_settings_file_uses() {
+        assert_eq!(parse_hex_color("#FF000080").unwrap(), [1.0, 0.0, 0.0, 128.0 / 255.0]);
+        assert_eq!(parse_hex_color("#00ff00").unwrap(), [0.0, 1.0, 0.0, 1.0]);
+        assert_eq!(parse_hex_color("#00f").unwrap(), [0.0, 0.0, 1.0, 1.0]);
+        assert_eq!(parse_hex_color("#0000").unwrap(), [0.0, 0.0, 0.0, 0.0]);
+        assert_eq!(parse_hex_color(" #FFFFFF ").unwrap(), [1.0, 1.0, 1.0, 1.0]);
+    }
+
+    #[test]
+    fn anything_that_is_not_a_hex_colour_is_refused_by_name() {
+        for bad in ["FF0000", "#GG0000", "#12345", "#", "red", "/path/to/image.png"] {
+            let Err(crate::Error::Unsupported { what }) = parse_hex_color(bad) else {
+                panic!("{bad:?} should be refused");
+            };
+
+            assert!(what.contains(bad.trim()), "{what}");
+        }
+    }
 
     /// Within a thousandth, which on 8-bit input is a quarter of a code value.
     fn close(actual: [f32; 3], expected: [f32; 3]) -> bool {

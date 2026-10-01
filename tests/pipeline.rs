@@ -204,10 +204,10 @@ fn nothing_patent_encumbered_is_ever_encodable() {
         assert!(!encoding.is_encodable(), "{encoding} must not be written");
     }
 
-    for encoding in [Encoding::Av1, Encoding::Vp9] {
-        assert!(encoding.is_encodable());
-        assert!(encoding.is_royalty_free());
-    }
+    // AV1 is the one format vtome writes. VP9 is royalty-free too, and still
+    // not written: one output format.
+    assert!(Encoding::Av1.is_encodable() && Encoding::Av1.is_royalty_free());
+    assert!(!Encoding::Vp9.is_encodable() && Encoding::Vp9.is_royalty_free());
 }
 
 /// Decoding is honest about being unimplemented: an error naming what is
@@ -216,8 +216,10 @@ fn nothing_patent_encumbered_is_ever_encodable() {
 fn asking_for_a_decoder_fails_with_an_explanation() {
     use vtome::decode::{self, DecoderConfig};
 
+    // Use Theora (unsupported on all platforms) to test error message.
+    // (AV1 might have a decoder via decode-av1 or VideoToolbox features)
     let config = DecoderConfig {
-        encoding: vtome::Encoding::Av1,
+        encoding: vtome::Encoding::Theora,
         width: 1920,
         height: 1080,
         bit_depth: 8,
@@ -226,7 +228,7 @@ fn asking_for_a_decoder_fails_with_an_explanation() {
     };
 
     let Err(vtome::Error::NoDecoder { remedy, .. }) = decode::open(&config) else {
-        panic!("no decoder backend is implemented yet");
+        panic!("Theora decoder should not exist");
     };
 
     assert!(

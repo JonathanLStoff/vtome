@@ -21,6 +21,12 @@ MONITOR ?=
 KEYSTONE ?=
 # 0.0 to 1.0.
 OPACITY ?=
+# `make play` only. A rectangle of the monitor, in its own pixels: x,y,width,height.
+AREA ?=
+# `make play` only. Any value: let the mouse fall through the overlay.
+CLICK_THROUGH ?=
+# `make play` only. Any value: close when the film ends rather than looping.
+ONCE ?=
 
 # Debug by default. Override when timing anything that touches pixels, since a
 # debug build measures the wrong thing:  make show PROFILE=--release
@@ -29,9 +35,14 @@ PROFILE ?=
 # The version to cut: make release v=0.2.0
 v ?=
 
+# `make docker-test` only: which systems, of debian ubuntu fedora alpine
+# windows-cross android macos windows. Empty means every one this host can run.
+# Not called OS, which Windows already sets for every program.
+SYSTEMS ?=
+
 .DEFAULT_GOAL := help
-.PHONY: help build test check fmt clippy doc clean release \
-        show monitors identify corner-pin require-cargo require-manifest \
+.PHONY: help build test docker-test check fmt clippy doc clean release \
+        show monitors play contact-sheet identify corner-pin require-cargo require-manifest \
         require-file require-version
 
 # --- checks ---------------------------------------------------------------
@@ -76,6 +87,16 @@ show: require-manifest require-file
 monitors: require-manifest
 	@LIST=1 $(CARGO) run $(PROFILE) --quiet --features window,image --example show
 
+## play: play a video as an on-top overlay (make play FILE=clip.mp4 MONITOR=1 AREA=40,40,640,360)
+play: require-manifest require-file
+	@MONITOR=$(MONITOR) KEYSTONE=$(KEYSTONE) OPACITY=$(OPACITY) AREA=$(AREA) \
+		CLICK_THROUGH=$(CLICK_THROUGH) ONCE=$(ONCE) \
+		$(CARGO) run $(PROFILE) --features window,decode-platform --example play -- "$(FILE)"
+
+## contact-sheet: decode a whole video and save six frames as one PNG (make contact-sheet FILE=clip.mp4)
+contact-sheet: require-manifest require-file
+	$(CARGO) run $(PROFILE) --features render,decode-platform --example contact_sheet -- "$(FILE)"
+
 ## identify: say what a file is, and what is inside it (make identify FILE=clip.mp4)
 identify: require-manifest require-file
 	$(CARGO) run $(PROFILE) --example identify -- "$(FILE)"
@@ -90,13 +111,17 @@ corner-pin: require-manifest
 build: require-manifest
 	$(CARGO) build $(PROFILE)
 
-## test: run the test suite, including the GPU tests
+## test: run the test suite, including the GPU tests and the platform decoder
 test: require-manifest
-	$(CARGO) test --features render
+	$(CARGO) test --features render,decode-platform
 
 ## test-core: the tests that need no GPU and no optional dependency
 test-core: require-manifest
 	$(CARGO) test --no-default-features
+
+## docker-test: the test matrix in a container per OS, and natively on a Mac (make docker-test SYSTEMS="debian alpine")
+docker-test:
+	sh docker/run.sh $(SYSTEMS)
 
 ## check: compile-check every feature combination that has to keep working
 check: require-manifest
@@ -104,6 +129,7 @@ check: require-manifest
 	$(CARGO) check
 	$(CARGO) check --features render
 	$(CARGO) check --features window --all-targets
+	$(CARGO) check --features window,decode-platform --all-targets
 
 ## fmt: format the source
 fmt: require-cargo

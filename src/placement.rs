@@ -10,9 +10,6 @@
 //! with a 4K monitor next to a 1080p one are a bug generator: the same logical
 //! coordinate is two different places depending on which monitor you ask.
 
-use std::collections::hash_map::DefaultHasher;
-use std::hash::Hasher;
-
 use crate::error::{Error, Result};
 use crate::geometry::{Fit, Point, Quad, Rect};
 
@@ -32,11 +29,8 @@ pub struct Monitor {
     pub refresh_millihertz: Option<u32>,
     /// Whether the platform considers this the primary display.
     pub is_primary: bool,
-    /// A persistent, unique identifier for this monitor across sessions.
-    /// On macOS: CGDirectDisplayID encoded as a hex string.
-    /// On Windows: HMONITOR encoded as a hex string.
-    /// On Linux: xrandr output name or port identifier.
-    /// Fallback: hash of monitor name and position for stability.
+    /// An identifier that stays the same across sessions, for a show file or
+    /// a settings file to name this monitor by. See [`monitor_id`].
     pub persistent_id: String,
 }
 
@@ -44,8 +38,12 @@ impl Monitor {
     /// A monitor, for tests and for platforms that report nothing useful.
     pub fn new(name: impl Into<String>, bounds: Rect) -> Self {
         let name_str = name.into();
-        let persistent_id =
-            generate_persistent_id(&name_str, bounds.x, bounds.y, 1.0, None);
+        let persistent_id = monitor_id(
+            &name_str,
+            bounds.x.round() as i32,
+            bounds.y.round() as i32,
+            1.0,
+        );
         Monitor {
             name: name_str,
             bounds,
@@ -70,22 +68,51 @@ impl Monitor {
     }
 }
 
-fn generate_persistent_id(
-    name: &str,
-    x: f64,
-    y: f64,
-    scale_factor: f64,
-    refresh_millihertz: Option<u32>,
-) -> String {
-    use std::hash::Hash;
+/// The identifier vtome gives a monitor, from what every windowing layer can
+/// report about it: its name, where it sits in the desktop (physical pixels),
+/// and its scale factor.
+///
+/// One function, so that vtome's own windows and a Tauri host name the same
+/// monitor the same way. Tauri reports no refresh rate, which is why that is
+/// not part of it — and a display switched between 60 and 120 Hz is still the
+/// same display.
+///
+/// The name has to come out the same from winit and from Tauri's tao, or the
+/// two hosts disagree about every id. They do today: on macOS both say
+/// `Monitor #<CGDisplay model number>` (winit 0.30.13, tao 0.35.3) — worth
+/// rechecking when either is upgraded.
+///
+/// On Linux the xrandr output name (`HDMI-1`, `DP-2`) is used as it is, since
+/// it is already stable and readable. Everywhere else it is a hash, and the
+/// hash is FNV-1a spelled out here rather than `DefaultHasher`, whose
+/// algorithm the standard library is free to change between releases — which
+/// would quietly rename every monitor in every saved settings file.
+pub fn monitor_id(name: &str, x: i32, y: i32, scale_factor: f64) -> String {
+    if cfg!(target_os = "linux") && !name.is_empty() {
+        return format!("xrandr_{name}");
+    }
 
-    let mut hasher = DefaultHasher::new();
-    name.hash(&mut hasher);
-    x.to_bits().hash(&mut hasher);
-    y.to_bits().hash(&mut hasher);
-    scale_factor.to_bits().hash(&mut hasher);
-    refresh_millihertz.hash(&mut hasher);
-    format!("monitor_{:016x}", hasher.finish())
+    const OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+    const PRIME: u64 = 0x0000_0100_0000_01b3;
+
+    let mut hash = OFFSET;
+
+    // Field by field with a separator, so ("ab", 1) and ("a", …) cannot run
+    // into each other.
+    for part in [
+        name.as_bytes(),
+        &[0xff],
+        &x.to_le_bytes(),
+        &y.to_le_bytes(),
+        &scale_factor.to_bits().to_le_bytes(),
+    ] {
+        for byte in part {
+            hash ^= u64::from(*byte);
+            hash = hash.wrapping_mul(PRIME);
+        }
+    }
+
+    format!("monitor_{hash:016x}")
 }
 
 /// How to find the monitor a placement means.
@@ -451,6 +478,32 @@ mod tests {
             },
             Monitor::new("EPSON Projector", Rect::new(-1920.0, 0.0, 1920.0, 1080.0)),
         ]
+    }
+
+    /// Settings files name monitors by this, so it must never change by
+    /// accident. The expected values were computed independently of this code.
+    #[test]
+    fn monitor_ids_are_pinned_and_tell_monitors_apart() {
+        if cfg!(target_os = "linux") {
+            assert_eq!(monitor_id("HDMI-1", 0, 0, 1.0), "xrandr_HDMI-1");
+            return;
+        }
+
+        assert_eq!(monitor_id("DELL U2720Q", 3024, 0, 1.0), "monitor_342b0e446031e910");
+        assert_eq!(
+            monitor_id("Built-in Retina Display", 0, 0, 2.0),
+            "monitor_e16def3726bc150b"
+        );
+
+        assert_ne!(
+            monitor_id("DELL U2720Q", 3024, 0, 1.0),
+            monitor_id("DELL U2720Q", 0, 0, 1.0),
+            "two identical models side by side are two monitors"
+        );
+        assert_eq!(
+            Monitor::new("DELL U2720Q", Rect::new(3024.0, 0.0, 3840.0, 2160.0)).persistent_id,
+            monitor_id("DELL U2720Q", 3024, 0, 1.0)
+        );
     }
 
     #[test]

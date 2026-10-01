@@ -229,15 +229,19 @@ impl Mp4Demuxer {
             return Ok(None);
         };
 
-        let pts = scaled(sample.start_time, timescale);
+        // The crate's `start_time` comes from `stts`, which is the *decode*
+        // timeline. Treating it as the presentation time swaps the two for
+        // every file with B-frames, and a decoder reordering by PTS then
+        // shows them in decode order.
+        let dts = scaled(sample.start_time, timescale);
 
-        // The rendering offset is the gap between decode and display order, and
-        // it is signed: with B-frames a picture is displayed after one that was
-        // decoded later.
-        let dts = if sample.rendering_offset >= 0 {
-            pts.saturating_sub(scaled(sample.rendering_offset as u64, timescale))
+        // `ctts` carries the gap between decode and display, and it is signed:
+        // a version-1 box may show a picture before its decode time so that the
+        // first frame starts at zero.
+        let pts = if sample.rendering_offset >= 0 {
+            dts + scaled(sample.rendering_offset as u64, timescale)
         } else {
-            pts + scaled(sample.rendering_offset.unsigned_abs() as u64, timescale)
+            dts.saturating_sub(scaled(sample.rendering_offset.unsigned_abs() as u64, timescale))
         };
 
         Ok(Some(Packet {

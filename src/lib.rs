@@ -71,10 +71,25 @@ pub mod frame;
 pub mod geometry;
 pub mod identify;
 pub mod media;
+pub mod output;
+pub mod output_layer;
 pub mod placement;
+pub mod plugin;
+
+#[cfg(feature = "demux")]
+mod playback;
 
 #[cfg(feature = "demux")]
 pub mod demux;
+
+// A source is a file opened through a demuxer, and the compositor and player
+// are built from sources, so all three need one.
+#[cfg(feature = "demux")]
+pub mod compositor;
+#[cfg(feature = "demux")]
+pub mod player;
+#[cfg(feature = "demux")]
+pub mod video_source;
 
 #[cfg(feature = "image")]
 pub mod still;
@@ -85,18 +100,67 @@ pub mod render;
 #[cfg(feature = "window")]
 pub mod window;
 
+// The engine an application drives: outputs per monitor, clips added and
+// stopped from any thread. Two hosts share it — vtome's own windows, and a
+// Tauri application's.
+#[cfg(all(
+    feature = "render",
+    feature = "demux",
+    feature = "image",
+    any(feature = "window", feature = "tauri")
+))]
+mod engine;
+
+#[cfg(all(feature = "window", feature = "demux", feature = "image"))]
+mod standalone;
+
+#[cfg(feature = "tauri")]
+mod tauri_host;
+
+#[cfg(all(feature = "decode-platform", target_vendor = "apple"))]
+pub mod decode_videotoolbox;
+
+#[cfg(feature = "decode-av1")]
+pub mod decode_av1;
+
+#[cfg(feature = "decode-vp9")]
+pub mod decode_vp9;
+
 pub use clock::{Clock, MasterClock, Pacing};
 pub use color::ColorSpace;
+#[cfg(feature = "demux")]
+pub use compositor::{Compositor, CompositorStats};
 pub use decode::Decoder;
 pub use error::{Error, Result};
 pub use frame::{Frame, FramePool, PixelFormat};
 pub use geometry::{Fit, Point, Quad, Rect};
 pub use identify::{identify_bytes, identify_path, Container, Encoding};
 pub use media::{MediaInfo, Packet, TrackInfo, TrackKind};
+pub use output::Output;
+pub use output_layer::OutputLayer;
 pub use placement::{Monitor, MonitorSelector, Placement, ResolvedPlacement};
+pub use plugin::Plugin;
+#[cfg(feature = "demux")]
+pub use player::Player;
+#[cfg(feature = "demux")]
+pub use video_source::VideoSource;
 
 #[cfg(feature = "demux")]
 pub use demux::{open as open_media, Demuxer};
 
 #[cfg(feature = "image")]
 pub use still::load_image;
+
+#[cfg(all(
+    feature = "render",
+    feature = "demux",
+    feature = "image",
+    any(feature = "window", feature = "tauri")
+))]
+pub use engine::{Clip, ClipEnded, ClipId, Controls, Hold, OutputRect};
+
+#[cfg(all(feature = "window", feature = "demux", feature = "image"))]
+pub use standalone::Vtome;
+
+#[cfg(feature = "tauri")]
+pub use tauri_host::{Started, TauriVtome};

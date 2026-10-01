@@ -1,6 +1,6 @@
 [package]
 name = "vtome"
-version = "0.2.2"
+version = "0.2.3"
 edition = "2021"
 authors = ["Jonathan Stoff <JonathanLStoff@gmail.com>"]
 description = "Show images and video on a specific monitor — or a specific quadrilateral of one — with royalty-free codecs and no FFmpeg. GPU presentation with perspective-correct corner pinning, optional windowing, and a frame pipeline that stays in YUV until the shader."
@@ -38,6 +38,10 @@ bytemuck = { version = "1", optional = true, features = ["derive"] }
 pollster = { version = "0.4", optional = true }
 raw-window-handle = { version = "0.6", optional = true }
 winit = { version = "0.30", optional = true }
+# The `tauri` feature's host. Bare windows — no webview — are behind Tauri's
+# `unstable` feature. Default features are off so vtome never chooses a runtime:
+# the application's own tauri dependency brings wry.
+tauri = { version = "2", optional = true, default-features = false, features = ["unstable"] }
 
 # --- Encoding -------------------------------------------------------------
 # rav1e is the reason AV1 is the default target: a pure-Rust AV1 encoder, so a
@@ -60,6 +64,10 @@ import = ["demux"]
 # different capabilities and a build may want only the first.
 decode-av1 = []
 decode-vp9 = []
+# The operating system's decoder. On Apple targets that is VideoToolbox, called
+# through its C API directly, so this pulls in no crates — only system
+# frameworks. It is also the only way vtome reads H.264 and HEVC: the licence
+# is the OS vendor's, never ours.
 decode-platform = []
 all-decoders = ["decode-av1", "decode-vp9", "decode-platform"]
 
@@ -73,6 +81,10 @@ transcode = ["demux", "mux", "encode-av1"]
 render = ["dep:wgpu", "dep:bytemuck", "dep:pollster", "dep:raw-window-handle"]
 embed = ["render"]
 window = ["render", "dep:winit"]
+# The engine inside a Tauri application, which owns the event loop: vtome opens
+# Tauri windows (bare ones, which is Tauri's `unstable` feature) and draws into
+# them. Pulls in tauri and never winit.
+tauri = ["render", "demux", "image", "dep:tauri"]
 
 # Still images.
 image = ["dep:image"]
@@ -92,4 +104,16 @@ name = "corner_pin"
 [[example]]
 name = "show"
 required-features = ["window", "image"]
+
+[[example]]
+name = "play"
+required-features = ["window", "demux", "decode-platform"]
+
+[[example]]
+name = "engine"
+required-features = ["window", "demux", "image", "decode-platform"]
+
+[[example]]
+name = "contact_sheet"
+required-features = ["render", "demux", "decode-platform", "image"]
 

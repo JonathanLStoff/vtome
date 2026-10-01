@@ -21,6 +21,19 @@ Viewer::new(frame, placement).show()?;
 `Placement::corners` takes four arbitrary corners when a symmetric keystone is
 not the shape you need.
 
+A film goes up the same way, as an overlay — no window frame, transparent around
+the picture, above everything else, and optionally letting the mouse through:
+
+```rust
+let source = vtome::VideoSource::from_file("clip.mp4", None)?;
+let placement = Placement::new(MonitorSelector::Primary)
+    .area(vtome::geometry::Rect::new(40.0, 40.0, 640.0, 360.0))
+    .always_on_top(true);
+
+let report = Viewer::video(source, placement).click_through(true).show()?;
+println!("{} shown, {} dropped", report.presented, report.dropped);
+```
+
 ## The trapezoid is the point
 
 Putting a picture into four arbitrary corners is not a matter of moving the
@@ -46,14 +59,13 @@ inside out.
 
 ## Royalty-free is a constraint, not a preference
 
-vtome **writes** AV1 and VP9 — both AOMedia/Google royalty-free. It never writes
-H.264 or HEVC. It **reads** them through the decoder the operating system already
-ships and already licensed: VideoToolbox, Media Foundation, MediaCodec, VA-API.
-That is also the fast path, since those are the hardware decoders.
-
-AV1 first, because `rav1e` encodes it in pure Rust — where VP9 means libvpx and a
-C toolchain on five platforms. `Encoding::is_encodable()` is the same rule in
-code, and a test asserts it from outside the crate so it cannot quietly change.
+vtome decodes **H.264** and **AV1**, and writes **AV1** — nothing else. AV1 is
+AOMedia royalty-free, and `rav1e` encodes it in pure Rust. H.264 is never
+written, and it is only ever *read* through the decoder the operating system
+already ships and already licensed: VideoToolbox, Media Foundation, MediaCodec,
+VA-API. That is also the fast path, since those are the hardware decoders.
+`Encoding::is_encodable()` is the same rule in code, and a test asserts it from
+outside the crate so it cannot quietly change.
 
 ## What works today
 
@@ -64,20 +76,20 @@ code, and a test asserts it from outside the crate so it cannot quietly change.
 | `still` | Images in, as frames, down the same pipe as video |
 | `geometry` | Rectangles, convex quads, homographies, and the fit modes |
 | `placement` | Monitor selectors, areas, corner pinning, late resolution with a stated fallback |
+| `decode` | H.264 through VideoToolbox on macOS and iOS: hardware decode, NV12 straight to the shader, B-frames put back in display order |
 | `render` | wgpu: YUV→RGB and corner pinning in one shader pass, offscreen or onto a surface |
-| `window` | winit: an undecorated, transparent window on the monitor you named |
+| `window` | winit: a still or a film as an overlay — undecorated, transparent, optionally on top and click-through — on the monitor you named |
 | `clock` | Playback timing, and slaving video to an external (audio) master |
 | `bitstream` | Annex-B ↔ length-prefixed, and `avcC` parameter sets |
 
-**Not yet:** the decoders themselves. `decode` is the trait, the backend
-selection, and an error that names the backend that would have taken the work —
-deliberately, rather than a decoder that returns no frames and a black window.
-Encoding and transcoding are the same: planned in `planning/TODO.md` §2 and §4,
-not pretended at.
+**Not yet:** H.264 decoders on Windows, Android, and Linux; AV1 decoding (dav1d,
+and VideoToolbox on M3-class hardware); encoding and transcoding. Each is planned
+in `planning/TODO.md` §2 and §4. Where there is no decoder, opening a file says
+which feature or platform would have handled it — deliberately, rather than a
+decoder that returns no frames and a black window.
 
 So today vtome shows **still images** anywhere on your desktop, in any convex
-quadrilateral, and knows everything about a video file except how to turn its
-packets into pictures.
+quadrilateral, and on a Mac **plays H.264** there too.
 
 ## Everything heavy is optional
 
@@ -93,7 +105,8 @@ vtome = { version = "0.1", default-features = false, features = ["demux"] }
 | `render` | wgpu. A GPU and a surface — *not* a window | |
 | `window` | `render` + winit: vtome opens its own windows | |
 | `embed` | `render` against a surface someone else owns — the Tauri path | |
-| `decode-av1`, `decode-vp9`, `decode-platform` | One decoder backend each | |
+| `decode-platform` | The OS's own decoder — VideoToolbox so far. Links system frameworks; pulls in no crates | |
+| `decode-av1` | AV1 in software, everywhere (not implemented yet) | |
 | `encode-av1`, `mux`, `transcode` | Writing AV1 into WebM | |
 
 A build that decodes frames and hands them to somebody else's renderer compiles
@@ -137,7 +150,30 @@ make test          # everything, including the GPU tests where there is a GPU
 make corner-pin    # the homography, printed
 make monitors      # what is attached
 make show FILE=poster.png MONITOR=1 KEYSTONE=0.15
+make play FILE=clip.mp4 AREA=40,40,640,360 CLICK_THROUGH=1 ONCE=1
+make contact-sheet FILE=clip.mp4   # decode it all, save six frames as a PNG
 ```
+
+### On every operating system
+
+```sh
+make docker-test                           # every system this host can run
+make docker-test SYSTEMS="debian alpine"   # just these
+```
+
+Runs from Linux, Windows (`docker\run.ps1`, or `run.sh` from Git Bash), or an
+Apple-silicon Mac. Debian, Ubuntu, Fedora, and Alpine run the tests in
+containers — GPU tests included, on Mesa's software Vulkan — each carrying
+ffmpeg to rebuild the fixtures. Windows is cross-built and tested under Wine;
+Android is cross-built with the NDK. The native systems are skipped wherever
+they cannot run rather than failed: macOS (and the iOS cross-build) runs on a
+Mac, and a real Windows container only on a Windows host.
+
+The decoder's tests play `tests/data/bars_h264.mp4` — 2.7 KB, 24 frames, with
+B-frames — whose moving bar says which frame each picture is, so display order
+is checked from the pixels rather than trusted from timestamps. vtome cannot
+write H.264, so that fixture is committed; `tests/data/make_h264_fixture.sh`
+rebuilds it.
 
 The renderer's tests draw on a real GPU and read the pixels back — a keystoned
 quad has to come out narrower at the top, and the picture's midline has to land

@@ -20,6 +20,26 @@
 //! # Ok::<(), vtome::Error>(())
 //! ```
 //!
+//! A film is the same call with a [`crate::VideoSource`], and
+//! shows up as an overlay — above other applications and, if asked, letting
+//! the mouse through to them:
+//!
+//! ```no_run
+//! # #[cfg(feature = "demux")] {
+//! use vtome::{MonitorSelector, Placement, VideoSource};
+//! use vtome::geometry::Rect;
+//! use vtome::window::Viewer;
+//!
+//! let source = VideoSource::from_file("clip.mp4", None)?;
+//! let placement = Placement::new(MonitorSelector::Primary)
+//!     .area(Rect::new(40.0, 40.0, 640.0, 360.0))
+//!     .always_on_top(true);
+//!
+//! Viewer::video(source, placement).click_through(true).show()?;
+//! # }
+//! # Ok::<(), vtome::Error>(())
+//! ```
+//!
 //! # Mobile has no monitors
 //!
 //! iOS and Android give an application one surface and no desktop to place it
@@ -38,8 +58,12 @@ use winit::window::{Window, WindowId, WindowLevel};
 use crate::error::{Error, Result};
 use crate::frame::Frame;
 use crate::geometry::Rect;
-use crate::placement::{Monitor, Placement};
+use crate::placement::{monitor_id, Monitor, Placement};
+#[cfg(feature = "demux")]
+use crate::playback::{Playback, Tick};
 use crate::render::{Gpu, Renderer};
+#[cfg(feature = "demux")]
+use crate::video_source::VideoSource;
 
 /// The monitors attached right now.
 ///
@@ -85,7 +109,7 @@ pub fn monitors() -> Result<Vec<Monitor>> {
 }
 
 /// The monitors an active event loop can see.
-fn attached(event_loop: &ActiveEventLoop) -> Vec<Monitor> {
+pub(crate) fn attached(event_loop: &ActiveEventLoop) -> Vec<Monitor> {
     let primary = event_loop.primary_monitor();
 
     event_loop
@@ -107,14 +131,7 @@ fn describe(handle: &winit::monitor::MonitorHandle, is_primary: bool) -> Monitor
     let name = handle.name().unwrap_or_default();
     let scale_factor = handle.scale_factor();
     let refresh_millihertz = handle.refresh_rate_millihertz();
-
-    let persistent_id = get_persistent_monitor_id(
-        &name,
-        position.x,
-        position.y,
-        scale_factor,
-        refresh_millihertz,
-    );
+    let persistent_id = monitor_id(&name, position.x, position.y, scale_factor);
 
     Monitor {
         name,
@@ -131,70 +148,73 @@ fn describe(handle: &winit::monitor::MonitorHandle, is_primary: bool) -> Monitor
     }
 }
 
-/// Generate a persistent monitor ID from monitor attributes.
-/// On Linux, uses the monitor name (xrandr output name) which is stable.
-/// On other platforms, uses a hash of name, position, refresh rate, and scale factor.
-fn get_persistent_monitor_id(
-    name: &str,
-    x: i32,
-    y: i32,
-    scale_factor: f64,
-    refresh_millihertz: Option<u32>,
-) -> String {
-    #[cfg(target_os = "linux")]
-    {
-        // On Linux, prefer xrandr output name (e.g., "HDMI-1", "DP-2") if available.
-        // This is the most stable identifier and survives port changes.
-        if !name.is_empty() {
-            return format!("xrandr_{}", name);
-        }
-    }
-
-    // Fallback: hash the name, position, refresh rate, and scale factor for stability.
-    // This includes attributes that uniquely identify the monitor within the system.
-    hash_monitor_id(name, x, y, scale_factor, refresh_millihertz)
-}
-
-fn hash_monitor_id(
-    name: &str,
-    x: i32,
-    y: i32,
-    scale_factor: f64,
-    refresh_millihertz: Option<u32>,
-) -> String {
-    use std::collections::hash_map::DefaultHasher;
-    use std::hash::{Hash, Hasher};
-    let mut hasher = DefaultHasher::new();
-    name.hash(&mut hasher);
-    x.hash(&mut hasher);
-    y.hash(&mut hasher);
-    scale_factor.to_bits().hash(&mut hasher);
-    refresh_millihertz.hash(&mut hasher);
-    format!("monitor_{:016x}", hasher.finish())
-}
-
-/// Shows one picture, in one place, until it is closed.
+/// Shows a picture or a film in one place, as an overlay, until it is closed.
 ///
-/// Deliberately small: this is the "put that there" path, not a media player.
-/// A player belongs on top of [`Renderer`](crate::render::Renderer) with a
-/// decoder feeding it, and does not need to own the event loop the way this
-/// does.
+/// The window is the picture's own shape — the bounds of the placement's quad
+/// and no larger — with no title bar or border, and transparent wherever the
+/// quad does not reach, so a corner-pinned picture shows the desktop around it.
+/// With [`Placement::always_on_top`] it stays above other applications, and
+/// [`click_through`](Viewer::click_through) lets the mouse fall through to
+/// whatever is underneath: a graphic laid over the screen rather than an
+/// application window.
+///
+/// This is the "put that there" path. Seeking, playlists, and several layers on
+/// one output belong to an application built on
+/// [`Renderer`], which does not need to own the event
+/// loop the way this does.
 pub struct Viewer {
-    frame: Frame,
+    content: Content,
     placement: Placement,
     title: String,
     decorations: bool,
+    click_through: bool,
+    looping: bool,
 }
 
 impl Viewer {
     /// A viewer for one frame at one placement.
     pub fn new(frame: Frame, placement: Placement) -> Self {
+        Viewer::showing(Content::Still(frame), placement)
+    }
+
+    /// A viewer that plays `source` at one placement, looping unless told
+    /// [not to](Viewer::looping).
+    ///
+    /// Each picture goes up when its own timestamp says, against a clock that
+    /// starts once the first one is on screen — not as fast as they decode and
+    /// not one per refresh. Late pictures are dropped rather than shown late,
+    /// so a stall costs a few frames instead of permanent lag.
+    #[cfg(feature = "demux")]
+    pub fn video(source: VideoSource, placement: Placement) -> Self {
+        Viewer::showing(Content::Video(Box::new(Playback::new(source, true))), placement)
+    }
+
+    fn showing(content: Content, placement: Placement) -> Self {
         Viewer {
-            frame,
+            content,
             placement,
             title: "vtome".to_string(),
             decorations: false,
+            click_through: false,
+            looping: true,
         }
+    }
+
+    /// Whether the mouse passes through to whatever is underneath.
+    ///
+    /// Off by default. On, the overlay can no longer be clicked to give it
+    /// focus, and Escape only reaches a focused window — so something else has
+    /// to end it: the application that opened it, or a film that does not loop.
+    pub fn click_through(mut self, click_through: bool) -> Self {
+        self.click_through = click_through;
+        self
+    }
+
+    /// Whether a film starts again when it ends — the default — or the viewer
+    /// closes. A still ignores this.
+    pub fn looping(mut self, looping: bool) -> Self {
+        self.looping = looping;
+        self
     }
 
     /// The window title, where the platform shows one.
@@ -212,7 +232,8 @@ impl Viewer {
         self
     }
 
-    /// Opens the window and runs until it is closed or Escape is pressed.
+    /// Opens the window and runs until it is closed, Escape is pressed, or a
+    /// film that does not loop ends. Space pauses a film.
     ///
     /// Blocks. On macOS it has to be called from the main thread, which is the
     /// platform's rule rather than this crate's.
@@ -221,16 +242,21 @@ impl Viewer {
     ///
     /// [`Error::Render`] for anything the event loop, the GPU, or the window
     /// refuses; [`Error::NoSuchMonitor`] or [`Error::Placement`] from resolving
-    /// the placement against the monitors that are actually there.
-    pub fn show(self) -> Result<()> {
+    /// the placement against the monitors that are actually there;
+    /// [`Error::Decode`] if a film stops decoding partway.
+    pub fn show(self) -> Result<Report> {
         let event_loop = EventLoop::new().map_err(|error| Error::Render {
             reason: format!("the event loop would not start: {error}"),
         })?;
 
-        // Wait for events rather than spinning: one still picture redrawn at
-        // the refresh rate would burn a core to show something that is not
-        // changing.
-        event_loop.set_control_flow(ControlFlow::Wait);
+        // A still waits for events rather than spinning: redrawing one picture
+        // at the refresh rate would burn a core to show nothing new. A film
+        // polls, and the surface's vsync is what paces it.
+        event_loop.set_control_flow(match self.content {
+            Content::Still(_) => ControlFlow::Wait,
+            #[cfg(feature = "demux")]
+            Content::Video(_) => ControlFlow::Poll,
+        });
 
         let mut application = Application {
             viewer: self,
@@ -246,7 +272,76 @@ impl Viewer {
 
         match application.failure {
             Some(error) => Err(error),
-            None => Ok(()),
+            None => Ok(application.viewer.content.report()),
+        }
+    }
+}
+
+/// What happened while a [`Viewer`] was up.
+///
+/// The counters are [`crate::clock::Pacing`]'s: dropped pictures mean
+/// decoding fell behind the clock, and repeats mean the display refreshes
+/// faster than the film changes — normal, at 24 fps on a 60 Hz screen.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Report {
+    /// Pictures put on screen. One, for a still.
+    pub presented: u64,
+    /// Pictures that arrived too late to be worth showing.
+    pub dropped: u64,
+    /// Refreshes that showed the previous picture again.
+    pub repeated: u64,
+    /// How many times a film started again from the top.
+    pub loops: u32,
+    /// Whether the film was decoded in hardware. `None` for a still.
+    pub hardware_decode: Option<bool>,
+}
+
+/// What a viewer shows.
+enum Content {
+    Still(Frame),
+    #[cfg(feature = "demux")]
+    Video(Box<Playback>),
+}
+
+impl Content {
+    /// The picture, when there is only ever one.
+    fn still(&self) -> Option<&Frame> {
+        match self {
+            Content::Still(frame) => Some(frame),
+            #[cfg(feature = "demux")]
+            Content::Video(_) => None,
+        }
+    }
+
+    /// The picture's size, known before any window exists.
+    fn size(&self) -> (u32, u32) {
+        match self {
+            Content::Still(frame) => (frame.width(), frame.height()),
+            // As stored rather than as rotated: the renderer draws the planes
+            // as they are, so the placement has to be sized to match.
+            #[cfg(feature = "demux")]
+            Content::Video(playback) => playback.size(),
+        }
+    }
+
+    fn report(&self) -> Report {
+        match self {
+            Content::Still(_) => Report {
+                presented: 1,
+                ..Report::default()
+            },
+            #[cfg(feature = "demux")]
+            Content::Video(playback) => {
+                let (presented, dropped, repeated) = playback.counts();
+
+                Report {
+                    presented,
+                    dropped,
+                    repeated,
+                    loops: playback.loops(),
+                    hardware_decode: Some(playback.source().decoder().is_hardware()),
+                }
+            }
         }
     }
 }
@@ -255,8 +350,12 @@ impl Viewer {
 struct State {
     window: Arc<Window>,
     surface: wgpu::Surface<'static>,
+    config: wgpu::SurfaceConfiguration,
     gpu: Gpu,
     renderer: Renderer,
+    /// Whether anything has been uploaded yet. A film has nothing to draw
+    /// until its first picture decodes.
+    has_picture: bool,
     /// The quad in the window's own coordinates, ready for the shader.
     quad: crate::geometry::Quad,
     opacity: f32,
@@ -275,12 +374,9 @@ impl Application {
     /// Builds the window, the surface, and the renderer. Called once.
     fn start(&mut self, event_loop: &ActiveEventLoop) -> Result<State> {
         let monitors = attached(event_loop);
+        let (width, height) = self.viewer.content.size();
 
-        let resolved = self.viewer.placement.resolve(
-            self.viewer.frame.width(),
-            self.viewer.frame.height(),
-            &monitors,
-        )?;
+        let resolved = self.viewer.placement.resolve(width, height, &monitors)?;
 
         if resolved.fell_back {
             eprintln!(
@@ -315,6 +411,14 @@ impl Application {
                     })?,
             );
 
+        if self.viewer.click_through {
+            window
+                .set_cursor_hittest(false)
+                .map_err(|error| Error::Render {
+                    reason: format!("this platform will not let clicks through a window: {error}"),
+                })?;
+        }
+
         // The instance has to know about the display to make a surface from it,
         // which is why this is not `Gpu::new`.
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_with_display_handle(
@@ -330,44 +434,83 @@ impl Application {
         let gpu = Gpu::from_instance(instance, Some(&surface))?;
 
         let capabilities = surface.get_capabilities(&gpu.adapter);
-        let format = capabilities
-            .formats
-            .iter()
-            .copied()
-            .find(|format| !format.is_srgb())
-            .unwrap_or(capabilities.formats[0]);
+        let format = crate::render::surface_format(&capabilities);
 
         let size = window.inner_size();
 
-        surface.configure(
-            &gpu.device,
-            &wgpu::SurfaceConfiguration {
-                usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
-                format,
-                color_space: wgpu::SurfaceColorSpace::Srgb,
-                width: size.width.max(1),
-                height: size.height.max(1),
-                present_mode: wgpu::PresentMode::AutoVsync,
-                // Whether the compositor honours our alpha is the platform's
-                // decision; taking whatever it offers first is the only
-                // portable answer.
-                alpha_mode: capabilities.alpha_modes[0],
-                view_formats: vec![],
-                desired_maximum_frame_latency: 2,
-            },
-        );
+        let config = wgpu::SurfaceConfiguration {
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+            format,
+            color_space: wgpu::SurfaceColorSpace::Srgb,
+            width: size.width.max(1),
+            height: size.height.max(1),
+            present_mode: wgpu::PresentMode::AutoVsync,
+            alpha_mode: crate::render::see_through(&capabilities),
+            view_formats: vec![],
+            desired_maximum_frame_latency: 2,
+        };
+
+        surface.configure(&gpu.device, &config);
 
         let mut renderer = Renderer::new(&gpu, format)?;
-        renderer.upload(&gpu, &self.viewer.frame)?;
+        let mut has_picture = false;
+
+        if let Some(frame) = self.viewer.content.still() {
+            renderer.upload(&gpu, frame)?;
+            has_picture = true;
+        }
 
         Ok(State {
             window,
             surface,
+            config,
             gpu,
             renderer,
+            has_picture,
             quad: resolved.quad_in_window(),
             opacity: resolved.opacity,
         })
+    }
+
+    /// One refresh: a film decides what is due, then whatever is uploaded is
+    /// drawn.
+    fn refresh(&mut self, event_loop: &ActiveEventLoop) -> Result<()> {
+        let Some(state) = self.state.as_mut() else {
+            return Ok(());
+        };
+
+        #[cfg(feature = "demux")]
+        if let Content::Video(playback) = &mut self.viewer.content {
+            playback.looping = self.viewer.looping;
+
+            match playback.tick()? {
+                Tick::Show(frame) => {
+                    state.renderer.upload(&state.gpu, &frame)?;
+                    state.has_picture = true;
+                }
+                Tick::Hold => {}
+                Tick::Ended => {
+                    event_loop.exit();
+                    return Ok(());
+                }
+            }
+        }
+
+        if !state.has_picture {
+            return Ok(());
+        }
+
+        Application::redraw(state)?;
+
+        #[cfg(feature = "demux")]
+        if let Content::Video(playback) = &mut self.viewer.content {
+            playback.presented();
+        }
+
+        // Only a film uses the loop to end itself.
+        let _ = event_loop;
+
+        Ok(())
     }
 
     /// Draws one frame into the surface.
@@ -450,35 +593,47 @@ impl ApplicationHandler for Application {
                 ..
             } => event_loop.exit(),
 
-            WindowEvent::Resized(size) => {
-                let capabilities = state.surface.get_capabilities(&state.gpu.adapter);
-
-                state.surface.configure(
-                    &state.gpu.device,
-                    &wgpu::SurfaceConfiguration {
-                        usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
-                        format: state.renderer.format(),
-                        color_space: wgpu::SurfaceColorSpace::Srgb,
-                        width: size.width.max(1),
-                        height: size.height.max(1),
-                        present_mode: wgpu::PresentMode::AutoVsync,
-                        alpha_mode: capabilities.alpha_modes[0],
-                        view_formats: vec![],
-                        desired_maximum_frame_latency: 2,
+            #[cfg(feature = "demux")]
+            WindowEvent::KeyboardInput {
+                event:
+                    KeyEvent {
+                        logical_key: Key::Named(NamedKey::Space),
+                        state: ElementState::Pressed,
+                        repeat: false,
+                        ..
                     },
-                );
+                ..
+            } => {
+                if let Content::Video(playback) = &mut self.viewer.content {
+                    playback.toggle_pause();
+                }
+            }
+
+            WindowEvent::Resized(size) => {
+                state.config.width = size.width.max(1);
+                state.config.height = size.height.max(1);
+                state.surface.configure(&state.gpu.device, &state.config);
 
                 state.window.request_redraw();
             }
 
             WindowEvent::RedrawRequested => {
-                if let Err(error) = Application::redraw(state) {
+                if let Err(error) = self.refresh(event_loop) {
                     self.failure = Some(error);
                     event_loop.exit();
                 }
             }
 
             _ => {}
+        }
+    }
+
+    fn about_to_wait(&mut self, _event_loop: &ActiveEventLoop) {
+        // A film asks for the next refresh as soon as this one is done; the
+        // surface's vsync is what keeps that to one per display frame.
+        #[cfg(feature = "demux")]
+        if let (Content::Video(_), Some(state)) = (&self.viewer.content, &self.state) {
+            state.window.request_redraw();
         }
     }
 }

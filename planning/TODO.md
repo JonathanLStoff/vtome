@@ -17,15 +17,14 @@ image.png ──────────────image───────�
 
 Ordered roughly by what unblocks what.
 
-**Where things stand.** Everything up to the pictures themselves is built and
-tested: identification, both demuxers, the frame and colour model, the geometry,
-placement, the GPU renderer, the window, and the clock — 127 tests, including
-GPU tests that draw a keystoned quad and read the pixels back. What is *not*
-built is the decoders (§2) and the encoders (§4): §2 is the trait, the backend
-selection, and an error naming the backend that would have taken the work,
-deliberately rather than a decoder that returns no frames. So vtome today shows
-**still images** in any convex quadrilateral on any monitor, and knows everything
-about a video file except how to turn its packets into pictures.
+**Where things stand.** Identification, both demuxers, the frame and colour
+model, the geometry, placement, the GPU renderer and compositor, the window, the
+clock, H.264 decoding through VideoToolbox, and the `Vtome` engine in both its
+versions are built and tested — GPU tests included, which draw and read the
+pixels back. What is *not* built: H.264 decoding off Apple platforms, AV1
+decoding (§2), and encoding (§4). So vtome today puts stills, and on a Mac H.264
+video, in any convex quadrilateral on any monitor, in layers, from a
+standalone program or from inside a Tauri application.
 
 ---
 
@@ -35,23 +34,22 @@ Written down first because everything else follows from them, and because each
 one is the answer to "what is my best option across iOS, Android, Windows,
 macOS, and Linux".
 
-**AV1 is the format vtome writes. VP9 is the fallback it also writes.** Both are
-AOMedia/Google royalty-free — no per-unit licence, no H.264/HEVC patent pool.
-AV1 is the better bet of the two: `rav1e` encodes it in **pure Rust** (nasm only
-for the optional assembly), where VP9 encoding means libvpx and a C toolchain on
-five platforms. So the pure-Rust column of the original table gets *better* by
-choosing AV1 first, not worse. VP9 stays as the compatibility answer, since
-hardware VP9 decode is on nearly every Android phone and Apple Silicon Mac while
-hardware AV1 decode is only on recent GPUs and flagship phones.
+**Codec scope: decode H.264 and AV1, write AV1. Nothing else** (decided
+2026-09-24). H.264 is what arrives; AV1 is what vtome displays and saves. HEVC
+and VP9 are out of scope in both directions, so the VP9 fallback this plan once
+carried is gone.
+
+**AV1 is the format vtome writes.** AOMedia royalty-free — no per-unit licence,
+no H.264 patent pool — and `rav1e` encodes it in **pure Rust** (nasm only for
+the optional assembly), so a transcode build needs no C toolchain.
 
 **Decoding input is the hard half, and the OS is the way through it.** Reading
-the world's H.264/HEVC files without FFmpeg means one backend per platform:
-VideoToolbox (macOS, iOS), Media Foundation / D3D11VA (Windows), MediaCodec
-(Android), VA-API or V4L2-M2M (Linux). That is five backends — but they are
-hardware-accelerated, they ship with the OS, and the patent licence is the OS
-vendor's, not ours. Behind them sits a portable software path — dav1d/rav1d for
-AV1, libvpx for VP9 — so vtome can always read *its own* format everywhere, even
-where the OS offers nothing.
+H.264 without FFmpeg means one backend per platform: VideoToolbox (macOS, iOS),
+Media Foundation / D3D11VA (Windows), MediaCodec (Android), VA-API or V4L2-M2M
+(Linux). That is five backends — but they are hardware-accelerated, they ship
+with the OS, and the patent licence is the OS vendor's, not ours. Behind them
+sits a portable software AV1 decoder — dav1d/rav1d — so vtome can always read
+*its own* format everywhere, even where the OS offers nothing.
 
 **H.264 input on Linux is the one open licensing question.** VA-API covers it
 where the driver does; `openh264` compiled from source is the fallback, and
@@ -76,7 +74,6 @@ containers is the list we write (§1).
 | Video decode (input) | platform APIs | no | VideoToolbox / MediaFoundation / MediaCodec / VA-API |
 | AV1 decode | `dav1d-rs`, or `rav1d` | C / Rust port | `rav1d`'s release state needs checking before we depend on it |
 | AV1 encode | `rav1e` | yes | The reason AV1 is the default |
-| VP9 encode/decode | `vpx-sys` (libvpx) | C, safe wrapper | Fallback both ways |
 
 ---
 
@@ -154,9 +151,15 @@ build actually have.
 - [x] Backend selection: platform decoder first, software second, and an error
       naming the missing feature — and distinguishing "you did not compile it"
       from "this machine does not have it", which are different problems
-- [ ] **macOS/iOS** — VideoToolbox via the `objc2` family. H.264, HEVC, and AV1
-      on hardware that has it; frames arrive as `CVPixelBuffer`, which maps to a
-      Metal texture with no copy (see §5's zero-copy path)
+- [ ] **macOS/iOS** — VideoToolbox. H.264 is done (see CHANGELOG). Left:
+      - [ ] AV1 in hardware on the chips that have it (M3 and later, A17 Pro
+            and later): an `av1C` path to a format description. Everywhere
+            else AV1 is dav1d's job, below
+      - [ ] Zero-copy: the `CVPixelBuffer`'s IOSurface as a Metal texture
+      - [ ] Recover from `kVTInvalidSessionErr` (sleep/wake, GPU switch) by
+            reopening the session at the next keyframe
+      - [ ] Matroska H.264 with B-frames reorders by a fixed four-frame window;
+            reading `max_num_reorder_frames` from the SPS would make it exact
 - [ ] **Windows** — Media Foundation / D3D11VA through the `windows` crate.
       Output is a D3D11 texture; wgpu's DX12 backend needs it shared, so this is
       the interop that will take the longest
@@ -166,8 +169,13 @@ build actually have.
       a documented "software only" outcome where neither exists
 - [ ] **Portable software AV1** — dav1d via `dav1d-rs`, or `rav1d` if its
       release state holds up. This is the floor: it is what makes "vtome can
-      always play what vtome wrote" true on every target
-- [ ] **Portable software VP9** — libvpx via `vpx-sys`
+      always play what vtome wrote" true on every target. `decode_av1.rs` is a
+      stub today that returns no frames, so `decode-av1` currently opens AV1
+      files and shows nothing — it should refuse until it decodes
+- [ ] Remove the VP9 scaffolding now that VP9 is out of scope: the
+      `decode-vp9`/`encode-vp9` features, `decode_vp9.rs`, and
+      `Backend::LibVpx`. HEVC and VP9 should be refused as "not in vtome's
+      scope" rather than "not implemented yet"
 - [ ] Threading: decode off the render thread, bounded frame queue, backpressure
       rather than unbounded memory
 - [ ] Decoder capability query, so an application can ask *before* opening a file
@@ -196,15 +204,13 @@ build actually have.
       temporary files and no full-file buffering
 - [ ] AV1 via `rav1e`: CRF/quantizer, speed preset, tiles, threads, keyframe
       interval. Defaults that are sane for playback rather than for archival
-- [ ] VP9 via libvpx, behind `encode-vp9`, for the devices where hardware AV1
-      decode is not there yet
 - [ ] Mux to WebM (`webm-iterable`) as the native container; AV1-in-MP4 as an
       export option, since that is what more players open
 - [ ] Progress callback and cancellation. A 4K transcode is minutes to hours and
       must be interruptible — the same shape pfac wants for bundling
 - [ ] Resolution and frame-rate change on the way through, done on the GPU when
       a GPU is present and in a small pure-Rust scaler when it is not
-- [ ] Pass-through: an input already AV1 or VP9 is remuxed, not re-encoded.
+- [ ] Pass-through: an input already AV1 is remuxed, not re-encoded.
       Re-encoding what is already fine is the most common wasted hour in video
 - [ ] Hardware *encode* is deliberately not in scope yet: quality is worse, and
       the platform matrix doubles. Revisit only with a measured reason
@@ -238,6 +244,10 @@ a Tauri app or a game engine borrows without taking winit with it.
 - [x] Fit modes inside the quad: stretch, contain, cover, and a pixel-exact mode
 - [x] Opacity, and transparency outside the quad so a trapezoid shows what is
       behind it rather than a black box — "translucent" is in the name
+- [ ] **Composite rendering — multiple layers to one output:**
+      - [ ] **Phase 1:** Background layer — color or image
+      - [ ] **Phase 1:** Layer compositing — z-index ordering, blend modes
+      - [ ] **Phase 1:** Per-layer clipping (for odd shapes via plugins)
 - [ ] Frame pacing to the display's refresh: present by PTS against the
       compositor's clock, not by sleeping for `1/fps`
 
@@ -275,6 +285,8 @@ a Tauri + React app that owns its own window, and equally able to open its own.
 - [x] `embed` feature: `Gpu::from_instance` takes the host's instance and
       surface, and `Renderer::draw` takes any view. This is the Tauri path — no
       per-frame copy, and winit is never compiled
+- [ ] **Phase 1:** UI overlays — close button, dragging, resizing rendered sections.
+      Texture coordinates for mouse interaction
 - [ ] A worked Tauri example, rather than the README's description of one
 - [ ] Tauri/TypeScript handoff, documented with a working example:
       - preferred: a native child surface positioned under/over the webview,
@@ -310,17 +322,37 @@ a Tauri + React app that owns its own window, and equally able to open its own.
       dropped frames are not
 - [x] `Pacing`: present, wait, or drop against the master clock, with counters
       and a drop rate exposed for diagnosis
-- [ ] `Player` tying a demuxer, a decoder, and the clock together. Waiting on
-      §2 — there is nothing to pace until something decodes
+- [x] **Phase 1a:** `VideoSource` — demuxer, decoder, clock, frame queue, and plugin chain
+      per source. Takes demuxed packets, outputs frames to layers
+- [x] **Phase 1a:** `OutputLayer` — a VideoSource with position, size, z-index, and
+      layer-specific plugins. Renders to an intermediate texture
+- [x] **Phase 1a:** `Output` / `Scene` — collection of layers, background color/image,
+      composite renderer. Renders layers to final output texture
+- [x] **Phase 1a:** `Compositor` — manages multiple VideoSources and Outputs, coordinates
+      their frame delivery and timing
+- [x] **Phase 1b:** Integration tests — load → demux → decode → composite pipeline
+      tested with test fixtures (checkerboard, gradient frames)
+- [x] **Phase 1c:** Full playback test — end-to-end composition with multiple outputs,
+      layer ordering, opacity, background colors. All 154 tests passing.
+- [x] `Player` (higher-level) — tying a single VideoSource to an Output with UI
+      (close button stub). Wraps Compositor for simple cases
 - [ ] Seek: to the keyframe from §1's index, then decode-and-discard to the
       exact frame
 - [ ] Gapless transition between two files, and A/B crossfade, since this exists
       to feed a show-control application
-- [ ] Multi-output sync: several monitors showing several videos that must start
-      on the same frame
+- [ ] Multi-output sync: several monitors/outputs showing several videos that must
+      start on the same frame
 
 ## 10. Testing
 
+- [ ] **A Docker image per OS that runs the default toolkit's tests**, each
+      carrying the converters — ffmpeg with x264, AAC, MP3, Opus — so fixtures
+      are made inside rather than skipped (asked for 2026-09-30). **In
+      progress.** Docker runs Linux, so: Debian, Ubuntu, Fedora, and Alpine in
+      containers; Windows cross-built in a container and tested under Wine;
+      Android cross-built with the NDK; a native Windows Dockerfile for a
+      Windows host; and macOS and iOS, which cannot be containerised, by a
+      script run on a Mac
 - [x] Fixtures written by the test rather than committed, where the format
       allows it — a PNG saved by the same library that reads it cannot drift
       from what the decoder expects
@@ -344,6 +376,39 @@ a Tauri + React app that owns its own window, and equally able to open its own.
       a container whose index disagrees with its own headers
 - [ ] Memory ceiling: play a 4K file and assert the frame pool stops growing
 
+## 10.5. Plugins and Effects
+
+Plugins modify video feeds at the frame level or layer level, enabling effects,
+custom rendering (odd shapes), masking, and transformations.
+
+- [x] **Phase 1a:** `Plugin` trait — takes a frame, returns a frame
+      - [ ] Applied in-order per VideoSource
+      - [ ] Examples: rotation, scaling, color correction (implementations later)
+- [ ] Layer-level plugins — applied after composition for final polish
+      - [ ] Odd-shaped rendering (circles, polygons, beziers) via clipping/masking
+      - [ ] Blur, feathering, shadow effects
+- [ ] Plugin chaining — multiple plugins per source or per layer
+- [ ] Plugin parameters and configuration API
+- [ ] A plugin for corner-pinning shapes beyond rectangles (trapezoids, circles)
+
+## 10.6. Compositor and Output Scenes
+
+Multi-source, multi-layer rendering like OBS.
+
+- [ ] **Phase 1:** `VideoSource` — input file/device, demuxer, decoder, clock,
+      persistent ID, plugin chain
+- [ ] **Phase 1:** `OutputLayer` — references a VideoSource, with position, size,
+      z-index, visibility, opacity, blend mode, and layer plugins
+- [ ] **Phase 1:** `Output` / `Scene` — collection of layers, background color
+      or image (default black), target (monitor or texture). Composite renderer
+- [ ] **Phase 1:** `Compositor` — manages multiple VideoSources and Outputs,
+      coordinates frame delivery and timing across sources. Returns composite texture
+- [ ] Output configuration serialization (save/load scenes)
+- [ ] Layer ordering and visibility toggling
+- [ ] Background image support (not just color)
+- [ ] Blend modes per layer (normal, add, multiply, screen, etc.)
+- [ ] Real-time layer manipulation — add/remove/reorder during playback
+
 ## 11. Decisions still open
 
 - [ ] **H.264 input on Linux.** VA-API where the driver has it; otherwise
@@ -353,8 +418,6 @@ a Tauri + React app that owns its own window, and equally able to open its own.
 - [ ] **`rav1d` vs `dav1d-rs`.** The Rust port removes the C toolchain from every
       build, which is worth real effort — but only if its releases and its
       performance are there. Benchmark both before committing
-- [ ] **HEVC** input, which is patent-encumbered to decode as well. Platform
-      decoders sidestep it; a software fallback would not
 - [ ] Whether vtome ever writes MP4 itself or only WebM
 - [ ] HDR: tone-map to SDR at first, or carry PQ/HLG through to a display that
       can take it
@@ -363,11 +426,63 @@ a Tauri + React app that owns its own window, and equally able to open its own.
 
 ## 12. Later
 
+- [ ] **RTSP output** — stream Output to RTSP server (separate from monitor output).
+      Requires encoder (§4) and network mux. Phase 2 after single-monitor MVP
 - [ ] Hardware encode, if §4's measurement ever justifies it
 - [ ] Network sources: HTTP range requests, HLS/DASH — vtome reading from a
       `Read + Seek` rather than only a `File`, the same shape pfac wants
 - [ ] Playing straight out of a pfac bundle, since `pfac::Bundle::stream` is
       already `Read + Seek + Send` and that is exactly what a demuxer needs
-- [ ] Capture: screen or camera in, as a frame source
+- [ ] Video device input (webcam, HDMI capture) — with persistent IDs for hotplug resilience
+- [ ] Capture: screen in, as a frame source
 - [ ] Real-time effects between decode and present, as shader passes
 - [ ] Deinterlacing, for the archival footage that will inevitably turn up
+
+## 13. `Vtome`: the engine an application drives
+
+Asked for 2026-09-24, in the shape OrbitX already stores its outputs:
+`src-tauri/src/config/settings.rs` has `montior_size_out: HashMap<String,
+(i64, i64, i64, i64)>` and `video_matrix_in` keyed by vtome ids. The engine
+exists in both versions (see CHANGELOG); what is left:
+
+- [ ] **A video's audio goes to atome automatically**, and the video's clock
+      slaves to atome's play position through `MasterClock`. Needs atome's play
+      position (atome planning §13) and an optional `atome` feature here
+- [ ] **`import(input, output, options)`**, a free function rather than a
+      method: decode (H.264 through the OS decoder) → encode AV1 with `rav1e` →
+      mux (WebM, or AV1-in-MP4 — §11) → write to disk. This is §4's transcode
+      with a front door. `rav1e` is software and slow, so §4's progress
+      callback and cancellation are part of this, not extras
+      - [ ] Option to split the audio out as FLAC for atome — atome's side is
+            its planning §3.5 (FLAC writing) and §4 (audio out of video files)
+- [ ] **AAC through the OS, never a bundled decoder** (decided 2026-09-26) — the
+      same rule as H.264, for the same reason: the patent licence stays the
+      OS vendor's. The audio in an MP4 is nearly always AAC. vtome itself never
+      decodes audio, so this means `import`'s audio split and a video's audio
+      handed to atome both go through atome's OS AAC path (atome planning
+      §3.3), and vtome never pulls in a crate or feature that bundles one
+- [ ] Confirm by eye that a Tauri overlay is see-through outside the picture on
+      macOS. Transparency there is two AppKit calls vtome makes itself (Tauri
+      gates `transparent` behind `macos-private-api`); every test so far reads
+      the picture back offscreen, which cannot show the window's own alpha
+- [ ] Decode off the engine thread. Each output's films decode where they are
+      drawn today, which is fine at 1080p and will not be at several 4K layers
+- [ ] Hotplug: a monitor unplugged mid-show. Its surface reports `Lost` and is
+      reconfigured every frame; the output should close, and reopen when the
+      monitor returns, reported through `Controls`
+
+# IMPORTANT
+Move the default encoding from AV1 to VP9 for better compatibility with the OS.
+## Architecture:
+- import(input, output, output_audio:optional<path>) -> this will take a path to a file and convert it to VP9 and flac using atome if audio path is provided
+
+Engine can be using winit or tauri:
+
+- Engine.start(audio_enabled:bool, audio_engine:optional<atome>) -> this will start the engine and return a list of monitors (some items and imputs are opmitted for brevity)
+- Engine.add(Clip:vp9 path) -> this will add a clip to the engine and return a clip id, it will be a path
+- Engine.add_generic(video:path)
+- Engine.add_cached(Clip, frames:vec<start, end>, cache:vec<frames>) -> this will add a clip to the engine and return a clip id, it will be a path
+- Engine.stop(Clip_id) -> this will stop a clip from the engine
+- Engine.is_running(Clip_id) -> this will return true if the clip is running
+- Engine.is_finished(Clip_id) -> this will return true if the clip is finished
+- Engine.snapshot(Clip_id) -> this will return a frame from the clip

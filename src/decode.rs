@@ -22,12 +22,12 @@
 //! ours. The software backends are the floor — they are what makes "vtome can
 //! always play what vtome wrote" true everywhere.
 //!
-//! # None of the backends is implemented yet
+//! # What is implemented
 //!
-//! This module is the shape they plug into: the trait, the selection, and the
-//! errors. [`open`] refuses honestly, naming the backend that would have taken
-//! the work, rather than returning a decoder that produces nothing. See
-//! `planning/TODO.md` §2.
+//! VideoToolbox, for H.264 — see [`crate::decode_videotoolbox`], built on Apple
+//! targets with `decode-platform`. For everything else [`open`] refuses
+//! honestly, naming the backend that would have taken the work, rather than
+//! returning a decoder that produces nothing. See `planning/TODO.md` §2.
 
 use crate::color::ColorSpace;
 use crate::error::{Error, Result};
@@ -79,9 +79,9 @@ pub enum Backend {
     MediaCodec,
     /// The Linux hardware path.
     VaApi,
-    /// dav1d, in software, anywhere.
+    /// dav1d, in software, for AV1 anywhere.
     Dav1d,
-    /// libvpx, in software, anywhere.
+    /// libvpx, in software, for VP9/VP8 anywhere.
     LibVpx,
 }
 
@@ -168,7 +168,7 @@ impl std::fmt::Display for Backend {
 /// Every backend, in the order [`open`] tries them.
 ///
 /// Hardware first: it is faster, cooler, and — for H.264 and HEVC — the only
-/// path that does not raise a licensing question.
+/// path that does not raise a licensing question. Software backends fill gaps.
 pub const BACKENDS: [Backend; 6] = [
     Backend::VideoToolbox,
     Backend::MediaFoundation,
@@ -240,24 +240,62 @@ pub fn backends_for(encoding: Encoding) -> Vec<Backend> {
 pub fn open(config: &DecoderConfig) -> Result<Box<dyn Decoder>> {
     let candidates = backends_for(config.encoding);
 
-    let Some(backend) = candidates.first().copied() else {
+    let Some(first) = candidates.first().copied() else {
         return Err(Error::NoDecoder {
             encoding: config.encoding,
             remedy: remedy_for(config.encoding),
         });
     };
 
-    // Every backend is scaffolding today. This is deliberately an error rather
-    // than a decoder that returns no frames: a silent black window is the
-    // hardest kind of bug to find, and there is no honest picture to return.
-    Err(Error::NoDecoder {
+    // In order, keeping the most recent refusal: a hardware decoder that turns
+    // this stream down is a reason to try software, not to give up — and if
+    // everything refuses, the refusal is more use than "not implemented".
+    let mut refusal = None;
+
+    for backend in candidates {
+        match instantiate(backend, config) {
+            Some(Ok(decoder)) => return Ok(decoder),
+            Some(Err(error)) => refusal = Some(error),
+            None => {}
+        }
+    }
+
+    Err(refusal.unwrap_or_else(|| Error::NoDecoder {
         encoding: config.encoding,
         remedy: format!(
-            "{backend} would take this and is not implemented yet \
+            "{first} would take this and is not implemented yet \
              (planning/TODO.md §2); nothing decodes {} in this build",
             config.encoding
         ),
-    })
+    }))
+}
+
+/// The decoder one backend makes for `config`, or `None` where that backend is
+/// not implemented yet.
+// `config` goes unread in a build with no decoder feature.
+#[allow(unused_variables)]
+fn instantiate(backend: Backend, config: &DecoderConfig) -> Option<Result<Box<dyn Decoder>>> {
+    match backend {
+        #[cfg(all(feature = "decode-platform", target_vendor = "apple"))]
+        Backend::VideoToolbox => Some(
+            crate::decode_videotoolbox::VideoToolboxDecoder::new(config)
+                .map(|decoder| Box::new(decoder) as Box<dyn Decoder>),
+        ),
+
+        #[cfg(feature = "decode-av1")]
+        Backend::Dav1d => Some(
+            crate::decode_av1::Av1Decoder::new()
+                .map(|decoder| Box::new(decoder) as Box<dyn Decoder>),
+        ),
+
+        #[cfg(feature = "decode-vp9")]
+        Backend::LibVpx => Some(
+            crate::decode_vp9::Vp9Decoder::new()
+                .map(|decoder| Box::new(decoder) as Box<dyn Decoder>),
+        ),
+
+        _ => None,
+    }
 }
 
 /// What a person could do about there being no decoder.
@@ -292,6 +330,35 @@ fn remedy_for(encoding: Encoding) -> String {
             .collect::<Vec<_>>()
             .join(", ")
     )
+}
+
+/// A stub decoder for Phase 1 testing — returns empty frames.
+///
+/// This allows the architecture to be tested without waiting for real AV1 decoder
+/// implementation. Later, this will be replaced with actual decoders.
+pub struct StubDecoder;
+
+impl Decoder for StubDecoder {
+    fn encoding(&self) -> Encoding {
+        Encoding::Av1  // Stub: pretend it's AV1
+    }
+
+    fn decode(&mut self, _packet: &Packet) -> Result<Option<Frame>> {
+        // Stub: no actual decoding, return None to indicate buffering
+        Ok(None)
+    }
+
+    fn flush(&mut self) -> Result<Vec<Frame>> {
+        Ok(Vec::new())
+    }
+
+    fn reset(&mut self) -> Result<()> {
+        Ok(())
+    }
+
+    fn is_hardware(&self) -> bool {
+        false
+    }
 }
 
 #[cfg(test)]
@@ -344,12 +411,15 @@ mod tests {
     /// does not have it", because they are different problems.
     #[test]
     fn a_missing_decoder_names_the_feature_that_would_have_supplied_it() {
-        let Err(Error::NoDecoder { remedy, .. }) = open(&config(Encoding::Av1)) else {
-            panic!("no AV1 decoder is implemented yet");
+        // Use Theora, which no platform/feature supports, to test the error message.
+        // (AV1 might be supported by VideoToolbox on macOS if decode-platform is enabled)
+        let Err(Error::NoDecoder { remedy, .. }) = open(&config(Encoding::Theora)) else {
+            panic!("Theora decoder should not exist");
         };
 
+        // Should suggest transcoding for unsupported formats
         assert!(
-            remedy.contains("dav1d") || remedy.contains("decode-av1") || remedy.contains("§2"),
+            remedy.contains("transcode") || remedy.contains("§2"),
             "{remedy}"
         );
     }

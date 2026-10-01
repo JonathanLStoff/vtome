@@ -173,6 +173,9 @@ struct Uniforms {
 /// The textures one frame lives in, and what shape they were made for.
 struct Planes {
     textures: Vec<wgpu::Texture>,
+    /// This picture's own uniforms — its own rather than the renderer's, so
+    /// several pictures can go into one pass, each drawn in its own place.
+    uniforms: wgpu::Buffer,
     bind_group: wgpu::BindGroup,
     width: u32,
     height: u32,
@@ -186,17 +189,52 @@ struct Planes {
     bit_depth: u32,
 }
 
+/// One picture on the GPU, ready to draw — the unit
+/// [`Renderer::draw_layers`] composites.
+///
+/// Holds nothing until the first [`Renderer::upload_picture`], then textures
+/// for that frame's shape, reused for every later frame of the same shape. A
+/// picture belongs to the renderer that uploaded into it.
+#[derive(Default)]
+pub struct Picture {
+    planes: Option<Planes>,
+}
+
+impl Picture {
+    /// An empty picture. Nothing is allocated until something is uploaded.
+    pub fn new() -> Self {
+        Picture::default()
+    }
+
+    /// Whether nothing has been uploaded yet.
+    pub fn is_empty(&self) -> bool {
+        self.planes.is_none()
+    }
+}
+
+/// One picture to draw, where, and how opaque.
+#[derive(Clone, Copy)]
+pub struct Layer<'a> {
+    /// What to draw.
+    pub picture: &'a Picture,
+    /// Where, in the target's own pixels.
+    pub quad: Quad,
+    /// 0.0 to 1.0.
+    pub opacity: f32,
+}
+
 /// Draws frames.
 ///
-/// One renderer serves one target format. It holds the pipeline, the sampler,
-/// and the textures for the last frame uploaded — so playing a film reuses the
-/// same textures for every frame and allocates nothing after the first.
+/// One renderer serves one target format. It holds the pipeline and the
+/// sampler, and — for the one-picture case of [`upload`](Renderer::upload) and
+/// [`draw`](Renderer::draw) — a [`Picture`] of its own, so playing a film
+/// reuses the same textures for every frame and allocates nothing after the
+/// first. Several pictures at once are [`draw_layers`](Renderer::draw_layers).
 pub struct Renderer {
     pipeline: wgpu::RenderPipeline,
     layout: wgpu::BindGroupLayout,
     sampler: wgpu::Sampler,
-    uniforms: wgpu::Buffer,
-    planes: Option<Planes>,
+    current: Picture,
     format: wgpu::TextureFormat,
 }
 
@@ -299,19 +337,11 @@ impl Renderer {
             ..Default::default()
         });
 
-        let uniforms = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("vtome uniforms"),
-            size: std::mem::size_of::<Uniforms>() as u64,
-            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-
         Ok(Renderer {
             pipeline,
             layout,
             sampler,
-            uniforms,
-            planes: None,
+            current: Picture::new(),
             format,
         })
     }
@@ -321,7 +351,7 @@ impl Renderer {
         self.format
     }
 
-    /// Puts a frame's pixels on the GPU.
+    /// Puts a frame's pixels on the GPU, into the renderer's own picture.
     ///
     /// Textures are reused when the next frame is the same size and format,
     /// which during playback is every frame after the first.
@@ -331,155 +361,22 @@ impl Renderer {
     /// [`Error::Unsupported`] for a pixel format with no shader path yet,
     /// [`Error::Render`] if the picture is larger than the device allows.
     pub fn upload(&mut self, gpu: &Gpu, frame: &Frame) -> Result<()> {
-        // Checked before anything is allocated: a format with no shader path
-        // should fail on the way in, not once the textures exist.
-        mode_for(frame.format())?;
-
-        let limit = gpu.max_texture_size();
-        if frame.width() > limit || frame.height() > limit {
-            return Err(Error::Render {
-                reason: format!(
-                    "{}×{} is past this device's {limit}-pixel texture limit",
-                    frame.width(),
-                    frame.height()
-                ),
-            });
-        }
-
-        let stale = self.planes.as_ref().is_none_or(|planes| {
-            planes.width != frame.width()
-                || planes.height != frame.height()
-                || planes.format != frame.format()
-        });
-
-        if stale {
-            self.planes = Some(self.allocate(gpu, frame)?);
-        }
-
-        let planes = self.planes.as_mut().expect("just allocated");
-        planes.color = frame.color();
-        planes.bit_depth = frame.format().bit_depth();
-
-        let planes = self.planes.as_ref().expect("just allocated");
-
-        for (index, texture) in planes.textures.iter().enumerate() {
-            let (plane_width, plane_height) = frame
-                .format()
-                .plane_dimensions(index, frame.width(), frame.height())
-                .expect("the texture count came from the plane count");
-
-            let descriptor = frame.planes()[index];
-            let row_bytes = plane_width as usize
-                * frame.format().samples_per_pixel(index)
-                * frame.format().bytes_per_sample();
-
-            let data = frame.plane_data(index).ok_or_else(|| Error::Render {
-                reason: format!("plane {index} is not where the frame says it is"),
-            })?;
-
-            gpu.queue.write_texture(
-                wgpu::TexelCopyTextureInfo {
-                    texture,
-                    mip_level: 0,
-                    origin: wgpu::Origin3d::ZERO,
-                    aspect: wgpu::TextureAspect::All,
-                },
-                data,
-                wgpu::TexelCopyBufferLayout {
-                    offset: 0,
-                    // The decoder's own stride, padding and all — the texture
-                    // takes it directly rather than the frame being repacked.
-                    bytes_per_row: Some(descriptor.stride.max(row_bytes) as u32),
-                    rows_per_image: Some(plane_height),
-                },
-                wgpu::Extent3d {
-                    width: plane_width,
-                    height: plane_height,
-                    depth_or_array_layers: 1,
-                },
-            );
-        }
-
-        Ok(())
+        upload_into(&self.layout, &self.sampler, gpu, &mut self.current, frame)
     }
 
-    /// Makes the textures and the bind group for a frame's shape.
-    fn allocate(&self, gpu: &Gpu, frame: &Frame) -> Result<Planes> {
-        let format = frame.format();
-        let mut textures = Vec::new();
-        let mut views = Vec::new();
-
-        for index in 0..format.plane_count() {
-            let (width, height) = format
-                .plane_dimensions(index, frame.width(), frame.height())
-                .expect("index is below the plane count");
-
-            let texture = gpu.device.create_texture(&wgpu::TextureDescriptor {
-                label: Some("vtome plane"),
-                size: wgpu::Extent3d {
-                    width,
-                    height,
-                    depth_or_array_layers: 1,
-                },
-                mip_level_count: 1,
-                sample_count: 1,
-                dimension: wgpu::TextureDimension::D2,
-                format: texture_format(format, index),
-                usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
-                view_formats: &[],
-            });
-
-            views.push(texture.create_view(&wgpu::TextureViewDescriptor::default()));
-            textures.push(texture);
-        }
-
-        // The layout always has three plane slots; formats with fewer bind
-        // their first plane again rather than the shader branching on a
-        // binding that is not there.
-        let filler = &views[0];
-        let bound: Vec<&wgpu::TextureView> = (0..3)
-            .map(|index| views.get(index).unwrap_or(filler))
-            .collect();
-
-        let bind_group = gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("vtome planes"),
-            layout: &self.layout,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: self.uniforms.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: wgpu::BindingResource::TextureView(bound[0]),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 2,
-                    resource: wgpu::BindingResource::TextureView(bound[1]),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 3,
-                    resource: wgpu::BindingResource::TextureView(bound[2]),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 4,
-                    resource: wgpu::BindingResource::Sampler(&self.sampler),
-                },
-            ],
-        });
-
-        Ok(Planes {
-            textures,
-            bind_group,
-            width: frame.width(),
-            height: frame.height(),
-            format,
-            color: frame.color(),
-            bit_depth: format.bit_depth(),
-        })
+    /// Puts a frame's pixels into `picture`, for
+    /// [`draw_layers`](Renderer::draw_layers). Reuses its textures the way
+    /// [`upload`](Renderer::upload) does.
+    ///
+    /// # Errors
+    ///
+    /// As [`upload`](Renderer::upload).
+    pub fn upload_picture(&self, gpu: &Gpu, picture: &mut Picture, frame: &Frame) -> Result<()> {
+        upload_into(&self.layout, &self.sampler, gpu, picture, frame)
     }
 
-    /// Draws the frame most recently uploaded into `view`.
+    /// Draws the frame most recently [uploaded](Renderer::upload) into
+    /// `view`, clearing everything else to transparent.
     ///
     /// `quad` is in the target's own pixels — see
     /// [`ResolvedPlacement::quad_in_window`](crate::ResolvedPlacement::quad_in_window),
@@ -498,26 +395,98 @@ impl Renderer {
         quad: Quad,
         opacity: f32,
     ) -> Result<()> {
-        let Some(planes) = self.planes.as_ref() else {
+        if self.current.is_empty() {
             return Err(Error::Render {
                 reason: "nothing has been uploaded to draw".to_string(),
             });
-        };
+        }
 
-        // The inverse map: from a pixel on the target back to a texel. Working
-        // this way round is what makes the perspective divide per-pixel.
-        let inverse = quad.inverse_homography()?;
+        // Transparent rather than black: what is outside the quad belongs to
+        // whatever is behind it.
+        self.draw_layers(
+            gpu,
+            view,
+            target_width,
+            target_height,
+            wgpu::Color::TRANSPARENT,
+            &[Layer {
+                picture: &self.current,
+                quad,
+                opacity,
+            }],
+        )
+    }
 
-        let uniforms = Uniforms {
-            inverse: rows_padded(inverse),
-            color: planes.color.yuv_to_rgb(planes.bit_depth),
-            target_size: [target_width as f32, target_height as f32],
-            opacity: opacity.clamp(0.0, 1.0),
-            mode: mode_for(planes.format)? as u32,
-        };
+    /// Clears `view` to `clear`, then draws `layers` over it in order — the
+    /// last on top — in one pass.
+    ///
+    /// `clear` is premultiplied: half-transparent red is `(0.5, 0, 0, 0.5)`.
+    /// Layers blend source-over, so what lands in `view` is premultiplied
+    /// too, which is what a window wants with
+    /// [`CompositeAlphaMode::PreMultiplied`](wgpu::CompositeAlphaMode::PreMultiplied).
+    ///
+    /// Each picture goes in at most once per call: its uniforms say where it is
+    /// drawn, and one set of uniforms cannot say two places.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Placement`] if a quad is not convex, [`Error::Render`] if a
+    /// layer's picture has nothing uploaded or appears twice. Everything is
+    /// checked before anything is drawn, so a bad layer never leaves half a
+    /// frame behind.
+    pub fn draw_layers(
+        &self,
+        gpu: &Gpu,
+        view: &wgpu::TextureView,
+        target_width: u32,
+        target_height: u32,
+        clear: wgpu::Color,
+        layers: &[Layer<'_>],
+    ) -> Result<()> {
+        let mut prepared = Vec::with_capacity(layers.len());
 
-        gpu.queue
-            .write_buffer(&self.uniforms, 0, bytemuck::bytes_of(&uniforms));
+        for (index, layer) in layers.iter().enumerate() {
+            let Some(planes) = layer.picture.planes.as_ref() else {
+                return Err(Error::Render {
+                    reason: format!("layer {index} has nothing uploaded to draw"),
+                });
+            };
+
+            if let Some(earlier) = layers[..index]
+                .iter()
+                .position(|other| std::ptr::eq(other.picture, layer.picture))
+            {
+                return Err(Error::Render {
+                    reason: format!(
+                        "layers {earlier} and {index} are the same picture; upload the frame into \
+                         a second one to draw it twice"
+                    ),
+                });
+            }
+
+            // The inverse map: from a pixel on the target back to a texel.
+            // Working this way round is what makes the perspective divide
+            // per-pixel.
+            let inverse = layer.quad.inverse_homography()?;
+
+            prepared.push((
+                planes,
+                Uniforms {
+                    inverse: rows_padded(inverse),
+                    color: planes.color.yuv_to_rgb(planes.bit_depth),
+                    target_size: [target_width as f32, target_height as f32],
+                    opacity: layer.opacity.clamp(0.0, 1.0),
+                    mode: mode_for(planes.format)? as u32,
+                },
+            ));
+        }
+
+        // Each picture has its own buffer, so every write lands before the one
+        // submit below and no draw sees another's uniforms.
+        for (planes, uniforms) in &prepared {
+            gpu.queue
+                .write_buffer(&planes.uniforms, 0, bytemuck::bytes_of(uniforms));
+        }
 
         let mut encoder = gpu
             .device
@@ -533,9 +502,10 @@ impl Renderer {
                     depth_slice: None,
                     resolve_target: None,
                     ops: wgpu::Operations {
-                        // Transparent rather than black: what is outside the
-                        // quad belongs to whatever is behind it.
-                        load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                        // Cleared once, here, and never again in the pass —
+                        // clearing per picture is how a second layer erases
+                        // the first.
+                        load: wgpu::LoadOp::Clear(clear),
                         store: wgpu::StoreOp::Store,
                     },
                 })],
@@ -546,10 +516,13 @@ impl Renderer {
             });
 
             pass.set_pipeline(&self.pipeline);
-            pass.set_bind_group(0, &planes.bind_group, &[]);
-            // Three vertices, no buffers: the vertex shader makes a triangle
-            // big enough to cover the target out of its own index.
-            pass.draw(0..3, 0..1);
+
+            for (planes, _) in &prepared {
+                pass.set_bind_group(0, &planes.bind_group, &[]);
+                // Three vertices, no buffers: the vertex shader makes a
+                // triangle big enough to cover the target out of its own index.
+                pass.draw(0..3, 0..1);
+            }
         }
 
         gpu.queue.submit(std::iter::once(encoder.finish()));
@@ -575,20 +548,154 @@ impl Renderer {
         quad: Quad,
         opacity: f32,
     ) -> Result<Vec<u8>> {
-        if self.format != wgpu::TextureFormat::Rgba8Unorm {
-            return Err(Error::Render {
-                reason: format!(
-                    "this renderer draws {:?}; reading back as RGBA8 needs one built for \
-                     TextureFormat::Rgba8Unorm",
-                    self.format
-                ),
-            });
-        }
-
+        self.require_rgba8()?;
         self.upload(gpu, frame)?;
 
-        let target = gpu.device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("vtome offscreen"),
+        read_back(gpu, self.format, width, height, |view| {
+            self.draw(gpu, view, width, height, quad, opacity)
+        })
+    }
+
+    /// [`draw_layers`](Renderer::draw_layers) into an offscreen texture, read
+    /// back as RGBA8 — premultiplied, as `draw_layers` leaves it.
+    ///
+    /// # Errors
+    ///
+    /// As [`draw_layers`](Renderer::draw_layers), plus [`Error::Render`] if the
+    /// readback fails or this renderer does not draw RGBA8.
+    pub fn render_layers_to_rgba(
+        &self,
+        gpu: &Gpu,
+        width: u32,
+        height: u32,
+        clear: wgpu::Color,
+        layers: &[Layer<'_>],
+    ) -> Result<Vec<u8>> {
+        self.require_rgba8()?;
+
+        read_back(gpu, self.format, width, height, |view| {
+            self.draw_layers(gpu, view, width, height, clear, layers)
+        })
+    }
+
+    /// Readback copies four 8-bit channels a pixel, so it takes the two
+    /// formats windows actually use: RGBA, and the BGRA most platforms
+    /// prefer for a surface.
+    fn require_rgba8(&self) -> Result<()> {
+        if matches!(
+            self.format,
+            wgpu::TextureFormat::Rgba8Unorm | wgpu::TextureFormat::Bgra8Unorm
+        ) {
+            return Ok(());
+        }
+
+        Err(Error::Render {
+            reason: format!(
+                "this renderer draws {:?}; reading back needs one built for \
+                 Rgba8Unorm or Bgra8Unorm",
+                self.format
+            ),
+        })
+    }
+}
+
+/// Puts a frame's pixels into `picture`, allocating only when its shape
+/// changed.
+fn upload_into(
+    layout: &wgpu::BindGroupLayout,
+    sampler: &wgpu::Sampler,
+    gpu: &Gpu,
+    picture: &mut Picture,
+    frame: &Frame,
+) -> Result<()> {
+    // Checked before anything is allocated: a format with no shader path
+    // should fail on the way in, not once the textures exist.
+    mode_for(frame.format())?;
+
+    let limit = gpu.max_texture_size();
+    if frame.width() > limit || frame.height() > limit {
+        return Err(Error::Render {
+            reason: format!(
+                "{}×{} is past this device's {limit}-pixel texture limit",
+                frame.width(),
+                frame.height()
+            ),
+        });
+    }
+
+    let stale = picture.planes.as_ref().is_none_or(|planes| {
+        planes.width != frame.width()
+            || planes.height != frame.height()
+            || planes.format != frame.format()
+    });
+
+    if stale {
+        picture.planes = Some(allocate(layout, sampler, gpu, frame));
+    }
+
+    let planes = picture.planes.as_mut().expect("just allocated");
+    planes.color = frame.color();
+    planes.bit_depth = frame.format().bit_depth();
+
+    for (index, texture) in planes.textures.iter().enumerate() {
+        let (plane_width, plane_height) = frame
+            .format()
+            .plane_dimensions(index, frame.width(), frame.height())
+            .expect("the texture count came from the plane count");
+
+        let descriptor = frame.planes()[index];
+        let row_bytes = plane_width as usize
+            * frame.format().samples_per_pixel(index)
+            * frame.format().bytes_per_sample();
+
+        let data = frame.plane_data(index).ok_or_else(|| Error::Render {
+            reason: format!("plane {index} is not where the frame says it is"),
+        })?;
+
+        gpu.queue.write_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            data,
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                // The decoder's own stride, padding and all — the texture
+                // takes it directly rather than the frame being repacked.
+                bytes_per_row: Some(descriptor.stride.max(row_bytes) as u32),
+                rows_per_image: Some(plane_height),
+            },
+            wgpu::Extent3d {
+                width: plane_width,
+                height: plane_height,
+                depth_or_array_layers: 1,
+            },
+        );
+    }
+
+    Ok(())
+}
+
+/// Makes the textures, the uniforms, and the bind group for a frame's shape.
+fn allocate(
+    layout: &wgpu::BindGroupLayout,
+    sampler: &wgpu::Sampler,
+    gpu: &Gpu,
+    frame: &Frame,
+) -> Planes {
+    let format = frame.format();
+    let mut textures = Vec::new();
+    let mut views = Vec::new();
+
+    for index in 0..format.plane_count() {
+        let (width, height) = format
+            .plane_dimensions(index, frame.width(), frame.height())
+            .expect("index is below the plane count");
+
+        let texture = gpu.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("vtome plane"),
             size: wgpu::Extent3d {
                 width,
                 height,
@@ -597,96 +704,213 @@ impl Renderer {
             mip_level_count: 1,
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
-            format: wgpu::TextureFormat::Rgba8Unorm,
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+            format: texture_format(format, index),
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
             view_formats: &[],
         });
 
-        let view = target.create_view(&wgpu::TextureViewDescriptor::default());
-        self.draw(gpu, &view, width, height, quad, opacity)?;
+        views.push(texture.create_view(&wgpu::TextureViewDescriptor::default()));
+        textures.push(texture);
+    }
 
-        // Buffer-to-texture copies want rows aligned; the padding comes back
-        // off below.
-        let unpadded = width * 4;
-        let padded = unpadded.div_ceil(ROW_ALIGNMENT) * ROW_ALIGNMENT;
+    let uniforms = gpu.device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("vtome uniforms"),
+        size: std::mem::size_of::<Uniforms>() as u64,
+        usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
 
-        let readback = gpu.device.create_buffer(&wgpu::BufferDescriptor {
+    // The layout always has three plane slots; formats with fewer bind
+    // their first plane again rather than the shader branching on a
+    // binding that is not there.
+    let filler = &views[0];
+    let bound: Vec<&wgpu::TextureView> = (0..3)
+        .map(|index| views.get(index).unwrap_or(filler))
+        .collect();
+
+    let bind_group = gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("vtome planes"),
+        layout,
+        entries: &[
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: uniforms.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: wgpu::BindingResource::TextureView(bound[0]),
+            },
+            wgpu::BindGroupEntry {
+                binding: 2,
+                resource: wgpu::BindingResource::TextureView(bound[1]),
+            },
+            wgpu::BindGroupEntry {
+                binding: 3,
+                resource: wgpu::BindingResource::TextureView(bound[2]),
+            },
+            wgpu::BindGroupEntry {
+                binding: 4,
+                resource: wgpu::BindingResource::Sampler(sampler),
+            },
+        ],
+    });
+
+    Planes {
+        textures,
+        uniforms,
+        bind_group,
+        width: frame.width(),
+        height: frame.height(),
+        format,
+        color: frame.color(),
+        bit_depth: format.bit_depth(),
+    }
+}
+
+/// Runs `draw` into a fresh texture of `format` and reads the pixels back as
+/// RGBA8, swapping red and blue if the texture was BGRA.
+fn read_back(
+    gpu: &Gpu,
+    format: wgpu::TextureFormat,
+    width: u32,
+    height: u32,
+    draw: impl FnOnce(&wgpu::TextureView) -> Result<()>,
+) -> Result<Vec<u8>> {
+    let target = gpu.device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("vtome offscreen"),
+        size: wgpu::Extent3d {
+            width,
+            height,
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format,
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+        view_formats: &[],
+    });
+
+    let view = target.create_view(&wgpu::TextureViewDescriptor::default());
+    draw(&view)?;
+
+    // Buffer-to-texture copies want rows aligned; the padding comes back
+    // off below.
+    let unpadded = width * 4;
+    let padded = unpadded.div_ceil(ROW_ALIGNMENT) * ROW_ALIGNMENT;
+
+    let readback = gpu.device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("vtome readback"),
+        size: u64::from(padded) * u64::from(height),
+        usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+        mapped_at_creation: false,
+    });
+
+    let mut encoder = gpu
+        .device
+        .create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("vtome readback"),
-            size: u64::from(padded) * u64::from(height),
-            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
-            mapped_at_creation: false,
         });
 
-        let mut encoder = gpu
-            .device
-            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("vtome readback"),
-            });
-
-        encoder.copy_texture_to_buffer(
-            wgpu::TexelCopyTextureInfo {
-                texture: &target,
-                mip_level: 0,
-                origin: wgpu::Origin3d::ZERO,
-                aspect: wgpu::TextureAspect::All,
+    encoder.copy_texture_to_buffer(
+        wgpu::TexelCopyTextureInfo {
+            texture: &target,
+            mip_level: 0,
+            origin: wgpu::Origin3d::ZERO,
+            aspect: wgpu::TextureAspect::All,
+        },
+        wgpu::TexelCopyBufferInfo {
+            buffer: &readback,
+            layout: wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(padded),
+                rows_per_image: Some(height),
             },
-            wgpu::TexelCopyBufferInfo {
-                buffer: &readback,
-                layout: wgpu::TexelCopyBufferLayout {
-                    offset: 0,
-                    bytes_per_row: Some(padded),
-                    rows_per_image: Some(height),
-                },
-            },
-            wgpu::Extent3d {
-                width,
-                height,
-                depth_or_array_layers: 1,
-            },
-        );
+        },
+        wgpu::Extent3d {
+            width,
+            height,
+            depth_or_array_layers: 1,
+        },
+    );
 
-        gpu.queue.submit(std::iter::once(encoder.finish()));
+    gpu.queue.submit(std::iter::once(encoder.finish()));
 
-        let (sender, receiver) = std::sync::mpsc::channel();
-        readback
-            .slice(..)
-            .map_async(wgpu::MapMode::Read, move |result| {
-                let _ = sender.send(result);
-            });
+    let (sender, receiver) = std::sync::mpsc::channel();
+    readback
+        .slice(..)
+        .map_async(wgpu::MapMode::Read, move |result| {
+            let _ = sender.send(result);
+        });
 
-        gpu.device
-            .poll(wgpu::PollType::wait_indefinitely())
-            .map_err(|error| Error::Render {
-                reason: format!("waiting for the GPU: {error}"),
-            })?;
+    gpu.device
+        .poll(wgpu::PollType::wait_indefinitely())
+        .map_err(|error| Error::Render {
+            reason: format!("waiting for the GPU: {error}"),
+        })?;
 
-        receiver
-            .recv()
-            .map_err(|_| Error::Render {
-                reason: "the readback never completed".to_string(),
-            })?
-            .map_err(|error| Error::Render {
-                reason: format!("mapping the readback buffer: {error}"),
-            })?;
+    receiver
+        .recv()
+        .map_err(|_| Error::Render {
+            reason: "the readback never completed".to_string(),
+        })?
+        .map_err(|error| Error::Render {
+            reason: format!("mapping the readback buffer: {error}"),
+        })?;
 
-        let mapped = readback
-            .slice(..)
-            .get_mapped_range()
-            .map_err(|error| Error::Render {
-                reason: format!("reading the mapped buffer: {error}"),
-            })?;
+    let mapped = readback
+        .slice(..)
+        .get_mapped_range()
+        .map_err(|error| Error::Render {
+            reason: format!("reading the mapped buffer: {error}"),
+        })?;
 
-        let mut pixels = Vec::with_capacity((unpadded * height) as usize);
-        for row in 0..height {
-            let start = (row * padded) as usize;
-            pixels.extend_from_slice(&mapped[start..start + unpadded as usize]);
-        }
-
-        drop(mapped);
-        readback.unmap();
-
-        Ok(pixels)
+    let mut pixels = Vec::with_capacity((unpadded * height) as usize);
+    for row in 0..height {
+        let start = (row * padded) as usize;
+        pixels.extend_from_slice(&mapped[start..start + unpadded as usize]);
     }
+
+    drop(mapped);
+    readback.unmap();
+
+    if format == wgpu::TextureFormat::Bgra8Unorm {
+        for pixel in pixels.chunks_exact_mut(4) {
+            pixel.swap(0, 2);
+        }
+    }
+
+    Ok(pixels)
+}
+
+/// The surface format to draw a window in: the first the platform offers that
+/// is not sRGB.
+///
+/// Video carries its own transfer curve, and an sRGB target would apply a
+/// second one on the way out.
+pub(crate) fn surface_format(capabilities: &wgpu::SurfaceCapabilities) -> wgpu::TextureFormat {
+    capabilities
+        .formats
+        .iter()
+        .copied()
+        .find(|format| !format.is_srgb())
+        .unwrap_or(capabilities.formats[0])
+}
+
+/// An alpha mode the desktop can see through, where the platform offers one.
+///
+/// [`Renderer::draw_layers`] leaves premultiplied colour behind — layers blend
+/// source-over onto a premultiplied clear — so pre-multiplied is the exact
+/// match. Post-multiplied agrees wherever the overlay is fully opaque or fully
+/// clear, and differs only at partial opacity. Opaque is the last resort, and
+/// on it everything around a corner-pinned quad is black.
+pub(crate) fn see_through(capabilities: &wgpu::SurfaceCapabilities) -> wgpu::CompositeAlphaMode {
+    use wgpu::CompositeAlphaMode::{Inherit, PostMultiplied, PreMultiplied};
+
+    [PreMultiplied, PostMultiplied, Inherit]
+        .into_iter()
+        .find(|mode| capabilities.alpha_modes.contains(mode))
+        .unwrap_or(capabilities.alpha_modes[0])
 }
 
 /// Which shader path a pixel format takes.
@@ -1011,11 +1235,11 @@ mod tests {
         renderer.upload(&gpu, &quadrants()).unwrap();
         // Identity by address: wgpu handles are reference-counted, so the same
         // texture reallocated would be a different pointer.
-        let first = std::ptr::addr_of!(renderer.planes.as_ref().unwrap().textures[0]) as usize;
-        let first_width = renderer.planes.as_ref().unwrap().width;
+        let first = std::ptr::addr_of!(renderer.current.planes.as_ref().unwrap().textures[0]) as usize;
+        let first_width = renderer.current.planes.as_ref().unwrap().width;
 
         renderer.upload(&gpu, &quadrants()).unwrap();
-        let second = std::ptr::addr_of!(renderer.planes.as_ref().unwrap().textures[0]) as usize;
+        let second = std::ptr::addr_of!(renderer.current.planes.as_ref().unwrap().textures[0]) as usize;
 
         assert_eq!(
             first, second,
@@ -1035,6 +1259,150 @@ mod tests {
         .unwrap();
 
         renderer.upload(&gpu, &bigger).unwrap();
-        assert_eq!(renderer.planes.as_ref().unwrap().width, 4);
+        assert_eq!(renderer.current.planes.as_ref().unwrap().width, 4);
+    }
+
+    fn solid(rgba: [u8; 4]) -> Frame {
+        Frame::packed(
+            2,
+            2,
+            PixelFormat::Rgba8,
+            ColorSpace::srgb(),
+            Duration::ZERO,
+            rgba.repeat(4),
+        )
+        .unwrap()
+    }
+
+    /// The compositor's whole job in one pass: a background colour where no
+    /// layer reaches, the first layer where only it does, and the second on
+    /// top where they overlap — which is exactly what clearing per layer got
+    /// wrong.
+    #[test]
+    fn layers_stack_in_one_pass_over_the_background() {
+        let Some(gpu) = gpu() else { return };
+        let renderer = Renderer::new(&gpu, wgpu::TextureFormat::Rgba8Unorm).unwrap();
+
+        let mut red = Picture::new();
+        let mut blue = Picture::new();
+        renderer
+            .upload_picture(&gpu, &mut red, &solid([255, 0, 0, 255]))
+            .unwrap();
+        renderer
+            .upload_picture(&gpu, &mut blue, &solid([0, 0, 255, 255]))
+            .unwrap();
+
+        let size = 64;
+        let green = wgpu::Color {
+            r: 0.0,
+            g: 1.0,
+            b: 0.0,
+            a: 1.0,
+        };
+
+        let pixels = renderer
+            .render_layers_to_rgba(
+                &gpu,
+                size,
+                size,
+                green,
+                &[
+                    Layer {
+                        picture: &red,
+                        quad: Quad::from_rect(Rect::new(0.0, 0.0, 40.0, 40.0)),
+                        opacity: 1.0,
+                    },
+                    Layer {
+                        picture: &blue,
+                        quad: Quad::from_rect(Rect::new(24.0, 24.0, 40.0, 40.0)),
+                        opacity: 1.0,
+                    },
+                ],
+            )
+            .unwrap();
+
+        assert_eq!(pixel(&pixels, size, 8, 8), [255, 0, 0, 255], "red alone");
+        assert_eq!(pixel(&pixels, size, 32, 32), [0, 0, 255, 255], "blue over red");
+        assert_eq!(pixel(&pixels, size, 56, 56), [0, 0, 255, 255], "blue alone");
+        assert_eq!(pixel(&pixels, size, 56, 8), [0, 255, 0, 255], "background");
+    }
+
+    /// Half-opaque white over a transparent background comes out
+    /// premultiplied — half-grey at half alpha — which is what a see-through
+    /// window's compositor expects.
+    #[test]
+    fn a_translucent_layer_over_nothing_is_premultiplied() {
+        let Some(gpu) = gpu() else { return };
+        let renderer = Renderer::new(&gpu, wgpu::TextureFormat::Rgba8Unorm).unwrap();
+
+        let mut white = Picture::new();
+        renderer
+            .upload_picture(&gpu, &mut white, &solid([255, 255, 255, 255]))
+            .unwrap();
+
+        let size = 16;
+        let pixels = renderer
+            .render_layers_to_rgba(
+                &gpu,
+                size,
+                size,
+                wgpu::Color::TRANSPARENT,
+                &[Layer {
+                    picture: &white,
+                    quad: Quad::from_rect(Rect::from_size(16.0, 16.0)),
+                    opacity: 0.5,
+                }],
+            )
+            .unwrap();
+
+        let [red, green, blue, alpha] = pixel(&pixels, size, 8, 8);
+
+        for channel in [red, green, blue, alpha] {
+            assert!((120..=136).contains(&channel), "{red} {green} {blue} {alpha}");
+        }
+    }
+
+    #[test]
+    fn one_picture_cannot_be_two_layers_in_one_pass() {
+        let Some(gpu) = gpu() else { return };
+        let renderer = Renderer::new(&gpu, wgpu::TextureFormat::Rgba8Unorm).unwrap();
+
+        let mut red = Picture::new();
+        renderer
+            .upload_picture(&gpu, &mut red, &solid([255, 0, 0, 255]))
+            .unwrap();
+
+        let layer = Layer {
+            picture: &red,
+            quad: Quad::from_rect(Rect::from_size(8.0, 8.0)),
+            opacity: 1.0,
+        };
+
+        assert!(matches!(
+            renderer.render_layers_to_rgba(&gpu, 8, 8, wgpu::Color::BLACK, &[layer, layer]),
+            Err(Error::Render { .. })
+        ));
+    }
+
+    #[test]
+    fn an_empty_picture_is_refused_rather_than_drawn_black() {
+        let Some(gpu) = gpu() else { return };
+        let renderer = Renderer::new(&gpu, wgpu::TextureFormat::Rgba8Unorm).unwrap();
+        let empty = Picture::new();
+
+        assert!(matches!(
+            renderer.render_layers_to_rgba(
+                &gpu,
+                8,
+                8,
+                wgpu::Color::BLACK,
+                &[Layer {
+                    picture: &empty,
+                    quad: Quad::from_rect(Rect::from_size(8.0, 8.0)),
+                    opacity: 1.0,
+                }]
+            ),
+            Err(Error::Render { .. })
+        ));
     }
 }

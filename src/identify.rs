@@ -169,12 +169,12 @@ impl Encoding {
         )
     }
 
-    /// Whether vtome can be asked to *produce* this.
+    /// Whether vtome can be asked to *produce* this. AV1, and nothing else.
     ///
     /// Deliberately narrower than [`is_royalty_free`](Encoding::is_royalty_free):
-    /// Theora is free of charge and still not worth writing in 2026.
+    /// VP9 and Theora are free of charge too, and vtome writes one format.
     pub fn is_encodable(self) -> bool {
-        matches!(self, Encoding::Av1 | Encoding::Vp9)
+        self == Encoding::Av1
     }
 
     /// The four-character code this encoding appears as in an MP4 sample entry.
@@ -517,11 +517,11 @@ mod tests {
             assert!(!encoding.is_encodable(), "{encoding} must never be written");
         }
 
-        for encoding in [Encoding::Av1, Encoding::Vp9] {
-            assert!(
-                encoding.is_royalty_free() && encoding.is_encodable(),
-                "{encoding}"
-            );
-        }
+        assert!(Encoding::Av1.is_royalty_free() && Encoding::Av1.is_encodable());
+
+        // Free of charge, and still not something vtome writes: one output
+        // format, and it is AV1.
+        assert!(Encoding::Vp9.is_royalty_free());
+        assert!(!Encoding::Vp9.is_encodable());
     }
 }

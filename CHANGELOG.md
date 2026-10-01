@@ -61,3 +61,72 @@ as it lands (see `.claude/CLAUDE.md` in the sibling crates for the habit).
   selection, and an error naming the backend that would have taken the work and
   distinguishing "you did not compile it" from "this machine does not have it".
   Deliberately not a decoder that returns no frames and a black window
+- **H.264 through VideoToolbox, in hardware** (`decode-platform`, Apple
+  targets). Plain `extern "C"` into VideoToolbox, CoreMedia, CoreVideo, and
+  CoreFoundation, every declaration checked against the SDK headers — no
+  Objective-C runtime and no crates. `avcC` → format description; MP4's
+  length-prefixed samples go in untouched; NV12 comes out with VideoToolbox's
+  own strides and goes straight to the shader. `is_hardware()` asks the session
+  rather than assuming. A 1280×720 file decodes at ~775 frames/s on an M1
+- **Display order out of decode order.** VideoToolbox emits decode order; a
+  reorder queue releases each picture once nothing still to be decoded can be
+  shown before it — exact where the container has decode times (MP4/MOV,
+  including negative composition offsets), a four-frame window where it does
+  not (Matroska)
+- **MP4 timestamps were swapped.** The `mp4` crate's `start_time` is the decode
+  time; it was being read as presentation time, so every file with B-frames had
+  PTS and DTS the wrong way round. `tests/mp4_timing.rs` fails on the old code
+- **`VideoSource` refuses what it cannot decode** instead of quietly swapping in
+  a stub decoder that produced no frames, and gained `rewind()`, `info()`, and
+  `decoder()`. `decode::open` now tries each candidate backend in turn
+- **Films as overlays.** `Viewer::video(source, placement)` plays a file the
+  way `Viewer::new` shows a still: undecorated, transparent around the picture,
+  optionally always on top and click-through, paced by `Pacing` against a clock
+  that starts once the window is actually on screen. `show()` returns a
+  `Report` of frames presented, dropped, and repeated. `make play` and
+  `make contact-sheet` are the examples. The surface now asks for an alpha mode
+  the desktop can see through rather than whichever the platform lists first
+- **Decode tests against a real H.264 file.** `tests/data/bars_h264.mp4` (2.7 KB,
+  24 frames, B-frames, rebuilt by `make_h264_fixture.sh`) carries a bar that
+  moves every frame, so display order is checked from the pixels; colour is
+  checked both on the CPU and through the GPU shader; a corrupt packet is an
+  error rather than a crash; rewinding plays the same pictures again
+- **Codec scope: decode H.264 and AV1, write AV1.** `is_encodable()` is AV1
+  only; HEVC and VP9 are out of scope
+- `--no-default-features` builds again: the source, compositor, and player
+  modules need a demuxer and now say so
+- **The compositor draws its layers.** `Renderer::draw_layers` clears once and
+  composites any number of `Picture`s in one pass — each with its own textures
+  and uniforms, so a second layer no longer erases the first — and the result
+  is premultiplied, which is what a see-through window wants.
+  `Compositor::draw_output` puts the background colour or image (covering, like
+  a wallpaper) under every visible layer, stacked by z-index (0 on top, equal
+  z-indices newest on top), scaled from the output's coordinates to the
+  target's, re-uploading a picture only when its source changed. Sources are
+  films or stills; a still runs until removed or for a number of frames.
+  `tick` reports sources that ended or failed rather than stopping the show for
+  one bad file. `render_output_to_rgba` reads an output back, in RGBA or BGRA
+- **`Vtome`, the engine an application drives, in two versions with one API.**
+  `new(excluded_monitors, frame_rate)`; `start(outputs, backgrounds)` with
+  OrbitX's `HashMap<String, (w, h, x, y)>` (monitor-relative, physical pixels)
+  and `#RRGGBBAA` or an image path per monitor; `add(Clip)` → `ClipId` for a
+  video, an image, or a frame, with an area, fit, opacity, z-index, and — for
+  stills — a duration counted as `time × frame rate` frames; `stop(id)`. Clips
+  open on the caller's thread, so a bad file is an error at `add`, not a gap on
+  screen. `Controls` does all of it from any thread and adds `snapshot`,
+  `take_ended`, and `skipped_monitors`. Outputs are borderless, always on top,
+  click-through, and never take focus
+  - **Standalone** (`window`): vtome's own winit loop; `start_with` hands over
+    the attached monitors first, since the loop is the only way to list them
+  - **Tauri** (`tauri`, for OrbitX): bare, webview-less Tauri windows made on
+    Tauri's main thread, with everything else on vtome's own thread. Made
+    see-through on macOS with public AppKit rather than Tauri's
+    `macos-private-api`. Checked in a scratch Tauri 2 app: the output opens in
+    0.65 s, plays, stops, and closes
+- **Monitor ids are stable and agree across both versions.** One
+  `placement::monitor_id` — name, desktop position, scale factor — hashed with
+  FNV-1a written out, because `DefaultHasher` may change between Rust releases
+  and would rename every monitor in a saved settings file. No refresh rate,
+  which Tauri does not report. winit and Tauri's tao name a Mac display the same
+  way, so both versions gave the built-in display `monitor_309c10e50ce2f28c`.
+  Pinned by a test
