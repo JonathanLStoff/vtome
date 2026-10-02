@@ -10,9 +10,20 @@
 //!
 //! When vtome runs next to `atome`, the audio clock leads and video follows. A
 //! dropped frame is invisible at 24 fps; a resampled or stuttered audio buffer
-//! is immediately audible. So [`Clock`] can be slaved to any [`MasterClock`] —
+//! is immediately audible. So playback runs against any [`MasterClock`] —
 //! implement it over the audio engine's play position and video will chase it.
+//!
+//! # One timeline, many clips
+//!
+//! The engine keeps a single timeline, a [`SharedClock`]: atome's output clock
+//! when there is audio (the `atome` feature implements [`MasterClock`] for
+//! `atome::PlayClock`), a [`Monotonic`] one when there is not. Every clip
+//! follows it through a [`Follower`] — its own play, pause, and seek, measured
+//! on the shared timeline rather than on a clock of its own. Clips cannot
+//! drift apart from each other or from the sound, because there is only one
+//! thing for them to drift from.
 
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 /// Something that knows what time it is in a stream.
@@ -118,6 +129,157 @@ impl MasterClock for Clock {
 
     fn is_running(&self) -> bool {
         self.anchor_instant.is_some()
+    }
+}
+
+/// A timeline every clip can hold: the engine's.
+pub type SharedClock = Arc<dyn MasterClock>;
+
+/// A master that runs from the moment it is made and never stops — the
+/// engine's timeline when there is no audio to follow.
+#[derive(Clone, Copy, Debug)]
+pub struct Monotonic {
+    started: Instant,
+}
+
+impl Monotonic {
+    /// Starting now, at zero.
+    pub fn new() -> Self {
+        Monotonic {
+            started: Instant::now(),
+        }
+    }
+
+    /// Starting now, as a [`SharedClock`].
+    pub fn shared() -> SharedClock {
+        Arc::new(Monotonic::new())
+    }
+}
+
+impl Default for Monotonic {
+    fn default() -> Self {
+        Monotonic::new()
+    }
+}
+
+impl MasterClock for Monotonic {
+    fn position(&self) -> Duration {
+        self.started.elapsed()
+    }
+}
+
+/// atome's output clock as a master: what the speakers are playing now, latency
+/// included, so pictures land with the sound they belong to.
+#[cfg(feature = "atome")]
+impl MasterClock for atome::PlayClock {
+    fn position(&self) -> Duration {
+        atome::PlayClock::position(self)
+    }
+
+    fn is_running(&self) -> bool {
+        atome::PlayClock::is_running(self)
+    }
+}
+
+/// One clip's position, measured on a shared master.
+///
+/// Play, pause, and seek are the clip's own; the time between them is the
+/// master's. Following a stopped master — an audio device that is paused or
+/// gone — freezes the clip where it is, which is the only thing a picture
+/// following a sound can sensibly do.
+#[derive(Clone)]
+pub struct Follower {
+    master: SharedClock,
+    /// Where the clip was when it last started, or was seeked while running.
+    from: Duration,
+    /// The master's position at that moment. `None` while paused.
+    master_at: Option<Duration>,
+}
+
+impl std::fmt::Debug for Follower {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("Follower")
+            .field("position", &self.position())
+            .field("running", &self.master_at.is_some())
+            .finish()
+    }
+}
+
+impl Follower {
+    /// Paused, at zero.
+    pub fn new(master: SharedClock) -> Self {
+        Follower {
+            master,
+            from: Duration::ZERO,
+            master_at: None,
+        }
+    }
+
+    /// Running, with the clip's zero at `master_position` on the master — in
+    /// the past, so the clip is already some way in, or in the future, so it
+    /// waits. See [`is_due`](Follower::is_due).
+    pub fn starting_at(master: SharedClock, master_position: Duration) -> Self {
+        Follower {
+            master,
+            from: Duration::ZERO,
+            master_at: Some(master_position),
+        }
+    }
+
+    /// The master this follows.
+    pub fn master(&self) -> &SharedClock {
+        &self.master
+    }
+
+    /// Starts, or resumes, from wherever the clip is.
+    pub fn play(&mut self) {
+        if self.master_at.is_none() {
+            self.master_at = Some(self.master.position());
+        }
+    }
+
+    /// Stops, keeping the position.
+    pub fn pause(&mut self) {
+        if self.master_at.is_some() {
+            self.from = self.position();
+            self.master_at = None;
+        }
+    }
+
+    /// Moves to a position. Keeps running if it was running.
+    pub fn seek(&mut self, position: Duration) {
+        self.from = position;
+
+        if self.master_at.is_some() {
+            self.master_at = Some(self.master.position());
+        }
+    }
+
+    /// Whether the clip itself is playing, whatever the master is doing.
+    pub fn is_playing(&self) -> bool {
+        self.master_at.is_some()
+    }
+
+    /// Whether the clip has reached its start: false only for a clip made
+    /// with [`starting_at`](Follower::starting_at) a point the master has not
+    /// got to yet.
+    pub fn is_due(&self) -> bool {
+        self.master_at
+            .is_none_or(|at| self.master.position() >= at)
+    }
+}
+
+impl MasterClock for Follower {
+    fn position(&self) -> Duration {
+        match self.master_at {
+            Some(at) => self.from + self.master.position().saturating_sub(at),
+            None => self.from,
+        }
+    }
+
+    fn is_running(&self) -> bool {
+        self.master_at.is_some() && self.master.is_running()
     }
 }
 
@@ -358,6 +520,106 @@ mod tests {
         pacing.reset();
         assert_eq!(pacing.counts(), (0, 0, 0));
         assert_eq!(pacing.drop_rate(), 0.0);
+    }
+
+    /// A master a test moves by hand, shared the way the engine shares one.
+    #[derive(Debug, Default)]
+    struct HandClock {
+        nanos: std::sync::atomic::AtomicU64,
+        stopped: std::sync::atomic::AtomicBool,
+    }
+
+    impl HandClock {
+        fn set(&self, position: Duration) {
+            self.nanos
+                .store(position.as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    impl MasterClock for HandClock {
+        fn position(&self) -> Duration {
+            Duration::from_nanos(self.nanos.load(std::sync::atomic::Ordering::Relaxed))
+        }
+
+        fn is_running(&self) -> bool {
+            !self.stopped.load(std::sync::atomic::Ordering::Relaxed)
+        }
+    }
+
+    #[test]
+    fn a_follower_measures_its_own_play_and_pause_on_the_master() {
+        let master = Arc::new(HandClock::default());
+        master.set(Duration::from_secs(100));
+
+        let mut clip = Follower::new(master.clone());
+        assert_eq!(clip.position(), Duration::ZERO, "paused at zero");
+
+        clip.play();
+        master.set(Duration::from_secs(103));
+        assert_eq!(clip.position(), Duration::from_secs(3));
+
+        clip.pause();
+        master.set(Duration::from_secs(110));
+        assert_eq!(clip.position(), Duration::from_secs(3), "paused clips hold");
+
+        clip.play();
+        master.set(Duration::from_secs(112));
+        assert_eq!(clip.position(), Duration::from_secs(5));
+
+        clip.seek(Duration::from_secs(60));
+        master.set(Duration::from_secs(113));
+        assert_eq!(clip.position(), Duration::from_secs(61));
+    }
+
+    /// Two clips on one master cannot drift apart: there is only one clock.
+    #[test]
+    fn clips_on_one_master_stay_together() {
+        let master = Arc::new(HandClock::default());
+        let mut first = Follower::new(master.clone());
+        let mut second = Follower::new(master.clone());
+
+        first.play();
+        master.set(Duration::from_millis(500));
+        second.play();
+        master.set(Duration::from_millis(10_500));
+
+        assert_eq!(first.position() - second.position(), Duration::from_millis(500));
+    }
+
+    /// The audio stops, the picture stops — and says so.
+    #[test]
+    fn a_stopped_master_stops_its_followers() {
+        let master = Arc::new(HandClock::default());
+        let mut clip = Follower::new(master.clone());
+        clip.play();
+        assert!(clip.is_running());
+
+        master.stopped.store(true, std::sync::atomic::Ordering::Relaxed);
+        assert!(!clip.is_running());
+    }
+
+    /// Lining a picture up with a sound scheduled for later on the master.
+    #[test]
+    fn a_clip_started_at_a_point_on_the_master_waits_for_it() {
+        let master = Arc::new(HandClock::default());
+        master.set(Duration::from_secs(5));
+
+        let clip = Follower::starting_at(master.clone(), Duration::from_secs(8));
+        assert!(!clip.is_due());
+        assert_eq!(clip.position(), Duration::ZERO);
+
+        master.set(Duration::from_secs(9));
+        assert!(clip.is_due());
+        assert_eq!(clip.position(), Duration::from_secs(1));
+    }
+
+    #[test]
+    fn the_monotonic_master_runs_from_the_moment_it_is_made() {
+        let master = Monotonic::shared();
+        std::thread::sleep(Duration::from_millis(5));
+
+        assert!(master.position() >= Duration::from_millis(5));
+        assert!(master.is_running());
     }
 
     /// Video chases audio, which is the whole point of the trait.

@@ -75,12 +75,34 @@ pub mod output;
 pub mod output_layer;
 pub mod placement;
 pub mod plugin;
+pub mod scale;
+
+// Writing: H.264 through the OS encoder, AV1 through the bundled rav1e.
+pub mod encode;
+
+#[cfg(all(feature = "encode-platform", target_vendor = "apple"))]
+pub mod encode_videotoolbox;
+
+#[cfg(feature = "encode-av1")]
+pub mod encode_av1;
 
 #[cfg(feature = "demux")]
 mod playback;
 
 #[cfg(feature = "demux")]
 pub mod demux;
+
+// Containers out: H.264 into MP4, AV1 into WebM.
+#[cfg(feature = "mux")]
+pub mod mux;
+
+// One file through decode, scale, encode, and mux.
+#[cfg(feature = "transcode")]
+pub mod transcode;
+
+// The import queue: a proxy at the output path now, the real file later.
+#[cfg(feature = "transcode")]
+pub mod import;
 
 // A source is a file opened through a demuxer, and the compositor and player
 // are built from sources, so all three need one.
@@ -123,14 +145,12 @@ pub mod decode_videotoolbox;
 #[cfg(feature = "decode-av1")]
 pub mod decode_av1;
 
-#[cfg(feature = "decode-vp9")]
-pub mod decode_vp9;
-
-pub use clock::{Clock, MasterClock, Pacing};
+pub use clock::{Clock, Follower, MasterClock, Monotonic, Pacing, SharedClock};
 pub use color::ColorSpace;
 #[cfg(feature = "demux")]
 pub use compositor::{Compositor, CompositorStats};
-pub use decode::Decoder;
+pub use decode::{Decoder, Hardware};
+pub use encode::Encoder;
 pub use error::{Error, Result};
 pub use frame::{Frame, FramePool, PixelFormat};
 pub use geometry::{Fit, Point, Quad, Rect};
@@ -143,7 +163,7 @@ pub use plugin::Plugin;
 #[cfg(feature = "demux")]
 pub use player::Player;
 #[cfg(feature = "demux")]
-pub use video_source::VideoSource;
+pub use video_source::{cache_frames, FrameCache, VideoSource};
 
 #[cfg(feature = "demux")]
 pub use demux::{open as open_media, Demuxer};
@@ -151,13 +171,19 @@ pub use demux::{open as open_media, Demuxer};
 #[cfg(feature = "image")]
 pub use still::load_image;
 
+#[cfg(feature = "transcode")]
+pub use import::{
+    import, import_progress, import_queue, import_with, ImportOptions, ImportQueue, JobId,
+    JobProgress, QueueConfig, Stage,
+};
+
 #[cfg(all(
     feature = "render",
     feature = "demux",
     feature = "image",
     any(feature = "window", feature = "tauri")
 ))]
-pub use engine::{Clip, ClipEnded, ClipId, Controls, Hold, OutputRect};
+pub use engine::{Audio, Clip, ClipEnded, ClipId, Controls, Hold, OutputRect};
 
 #[cfg(all(feature = "window", feature = "demux", feature = "image"))]
 pub use standalone::Vtome;

@@ -93,8 +93,6 @@ impl Player {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-
     #[test]
     fn player_creation_structure_test() {
         // In real tests, we'd create a player from a test video file

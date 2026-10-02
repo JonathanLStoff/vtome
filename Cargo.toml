@@ -1,6 +1,6 @@
 [package]
 name = "vtome"
-version = "0.2.3"
+version = "0.2.4"
 edition = "2021"
 authors = ["Jonathan Stoff <JonathanLStoff@gmail.com>"]
 description = "Show images and video on a specific monitor — or a specific quadrilateral of one — with royalty-free codecs and no FFmpeg. GPU presentation with perspective-correct corner pinning, optional windowing, and a frame pipeline that stays in YUV until the shader."
@@ -44,38 +44,59 @@ winit = { version = "0.30", optional = true }
 tauri = { version = "2", optional = true, default-features = false, features = ["unstable"] }
 
 # --- Encoding -------------------------------------------------------------
-# rav1e is the reason AV1 is the default target: a pure-Rust AV1 encoder, so a
-# transcode build needs no C toolchain. See planning/TODO.md.
+# rav1e: a pure-Rust AV1 encoder, so bundling one costs build time and no C
+# toolchain. H.264 — the default output — is never encoded by anything bundled;
+# only by the OS (`encode-platform`). See planning/TODO.md §14.
 rav1e = { version = "0.8", optional = true, default-features = false, features = [
     "threading",
 ] }
-webm-iterable = { version = "0.6", optional = true }
+
+# --- Audio ----------------------------------------------------------------
+# atome is the audio engine: its output's play position is the clock video
+# follows (`atome` feature), and its FLAC writer splits a film's audio out on
+# import (`split-audio`). Default features off — vtome turns on exactly what it
+# uses. `PlayClock` is newer than atome 0.8.2; until atome is released with it,
+# `.cargo/config.toml` (local, not committed) patches this to ../atome. Raise
+# the requirement to that release before publishing.
+atome = { version = "0.8.2", optional = true, default-features = false }
 
 [features]
 default = ["demux", "image"]
 
 # Containers in, both pure Rust.
 demux = ["dep:mp4", "dep:matroska-demuxer"]
-# Alias for demux, used by the publish workflow.
-import = ["demux"]
+# `vtome::import` and its queue: what the publish workflow tests.
+import = ["transcode"]
 
 # Decoders. Each gates a backend; none of them is implied by `demux`, because
 # reading a file's structure and being able to decode its pictures are
 # different capabilities and a build may want only the first.
 decode-av1 = []
-decode-vp9 = []
 # The operating system's decoder. On Apple targets that is VideoToolbox, called
 # through its C API directly, so this pulls in no crates — only system
-# frameworks. It is also the only way vtome reads H.264 and HEVC: the licence
-# is the OS vendor's, never ours.
+# frameworks. It is also the only way vtome reads H.264: the licence is the OS
+# vendor's, never ours.
 decode-platform = []
-all-decoders = ["decode-av1", "decode-vp9", "decode-platform"]
+all-decoders = ["decode-av1", "decode-platform"]
 
-# Encoding, and the container to put it in.
+# Encoders. AV1 through the bundled rav1e; H.264 through the operating
+# system's encoder only — VideoToolbox on Apple targets, system frameworks and
+# no crates, for the same licensing reason as decoding.
 encode-av1 = ["dep:rav1e"]
-encode-vp9 = []
-mux = ["dep:webm-iterable"]
-transcode = ["demux", "mux", "encode-av1"]
+encode-platform = []
+# Containers out: MP4 through the `mp4` crate's writer, WebM through a small
+# Matroska writer of vtome's own.
+mux = ["demux"]
+# Decode, scale, encode, mux — and the AV1 encoder always comes with it, so an
+# application that transcodes has AV1 wherever the OS has no H.264 encoder.
+transcode = ["demux", "mux", "decode-platform", "encode-platform", "encode-av1"]
+
+# Video follows atome's output clock: `Audio::atome(output.clock())`.
+atome = ["dep:atome"]
+# `import`'s `output_audio`: a film's soundtrack to FLAC through atome. Its own
+# feature because atome's `import` still decodes AAC with Symphonia's bundled
+# decoder (atome planning §3.3), which vtome must not pull in quietly.
+split-audio = ["transcode", "atome", "atome/import", "atome/export"]
 
 # Presentation.
 render = ["dep:wgpu", "dep:bytemuck", "dep:pollster", "dep:raw-window-handle"]

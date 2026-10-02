@@ -43,7 +43,7 @@ use std::time::Duration;
 
 use crate::bitstream::AvcConfig;
 use crate::color::{ColorSpace, Range};
-use crate::decode::{Decoder, DecoderConfig};
+use crate::decode::{Decoder, DecoderConfig, Hardware};
 use crate::error::{Error, Result};
 use crate::frame::{Frame, PixelFormat, Plane};
 use crate::identify::Encoding;
@@ -129,6 +129,8 @@ mod sys {
     extern "C" {
         pub static kCFTypeDictionaryKeyCallBacks: CFDictionaryCallBacks;
         pub static kCFTypeDictionaryValueCallBacks: CFDictionaryCallBacks;
+        pub static kCFBooleanTrue: CFBooleanRef;
+        pub static kCFBooleanFalse: CFBooleanRef;
 
         pub fn CFDictionaryCreate(
             allocator: CFAllocatorRef,
@@ -209,6 +211,11 @@ mod sys {
         // with an older deployment target fail to launch.
         #[cfg(target_os = "macos")]
         pub static kVTDecompressionPropertyKey_UsingHardwareAcceleratedVideoDecoder: CFStringRef;
+        // macOS only: iOS decodes H.264 in hardware and offers no choice.
+        #[cfg(target_os = "macos")]
+        pub static kVTVideoDecoderSpecification_EnableHardwareAcceleratedVideoDecoder: CFStringRef;
+        #[cfg(target_os = "macos")]
+        pub static kVTVideoDecoderSpecification_RequireHardwareAcceleratedVideoDecoder: CFStringRef;
 
         pub fn VTDecompressionSessionCreate(
             allocator: CFAllocatorRef,
@@ -323,6 +330,18 @@ impl VideoToolboxDecoder {
     /// track has no usable `avcC` record or VideoToolbox will not open a session
     /// for it.
     pub fn new(config: &DecoderConfig) -> Result<Self> {
+        VideoToolboxDecoder::with_hardware(config, Hardware::Prefer)
+    }
+
+    /// [`new`](VideoToolboxDecoder::new), on the hardware decoder, off it, or
+    /// whichever the machine has.
+    ///
+    /// # Errors
+    ///
+    /// As [`new`](VideoToolboxDecoder::new); and [`Error::NoDecoder`] when
+    /// hardware was required and the session landed elsewhere, or software
+    /// was asked for on a platform that decodes only in hardware.
+    pub fn with_hardware(config: &DecoderConfig, hardware: Hardware) -> Result<Self> {
         if config.encoding != Encoding::H264 {
             let remedy = match config.encoding {
                 // M3-class chips decode AV1 in hardware, and that path is
@@ -358,15 +377,25 @@ impl VideoToolboxDecoder {
             failure: None,
         }));
 
-        let session = open_session(&format, &output)?;
-        let hardware = uses_hardware(&session);
+        let specification = decoder_specification(hardware)?;
+        let session = open_session(&format, &output, specification.as_ref())?;
+        let on_hardware = uses_hardware(&session);
+
+        if hardware == Hardware::Require && !on_hardware {
+            return Err(Error::NoDecoder {
+                encoding: Encoding::H264,
+                remedy: "hardware decoding was required, and VideoToolbox opened a software \
+                         session — this machine has no H.264 decoder in silicon free for it"
+                    .to_string(),
+            });
+        }
 
         Ok(VideoToolboxDecoder {
             session,
             format,
             output,
             reorder: Reorder::default(),
-            hardware,
+            hardware: on_hardware,
         })
     }
 
@@ -583,8 +612,65 @@ fn format_description(avc: &AvcConfig) -> Result<Retained> {
         .ok_or_else(|| decode_error("CoreMedia made no format description from the SPS and PPS"))
 }
 
+/// What to ask VideoToolbox for: nothing for "whichever", or a dictionary that
+/// requires or rules out the hardware decoder.
+fn decoder_specification(hardware: Hardware) -> Result<Option<Retained>> {
+    #[cfg(target_os = "macos")]
+    {
+        // SAFETY: immutable framework constants.
+        let (key, value) = unsafe {
+            match hardware {
+                Hardware::Prefer => return Ok(None),
+                Hardware::Require => (
+                    sys::kVTVideoDecoderSpecification_RequireHardwareAcceleratedVideoDecoder,
+                    sys::kCFBooleanTrue,
+                ),
+                Hardware::Off => (
+                    sys::kVTVideoDecoderSpecification_EnableHardwareAcceleratedVideoDecoder,
+                    sys::kCFBooleanFalse,
+                ),
+            }
+        };
+
+        let keys = [key];
+        let values = [value];
+
+        // SAFETY: one key and one value, both live framework constants.
+        let dictionary = unsafe {
+            sys::CFDictionaryCreate(
+                sys::DEFAULT_ALLOCATOR,
+                keys.as_ptr(),
+                values.as_ptr(),
+                1,
+                ptr::addr_of!(sys::kCFTypeDictionaryKeyCallBacks),
+                ptr::addr_of!(sys::kCFTypeDictionaryValueCallBacks),
+            )
+        };
+
+        // SAFETY: a `Create` call's +1 reference.
+        unsafe { Retained::adopt(dictionary) }
+            .map(Some)
+            .ok_or_else(|| decode_error("CoreFoundation made no dictionary"))
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    match hardware {
+        Hardware::Off => Err(Error::NoDecoder {
+            encoding: Encoding::H264,
+            remedy: "this platform decodes H.264 only in hardware; software decoding is a \
+                     macOS choice"
+                .to_string(),
+        }),
+        _ => Ok(None),
+    }
+}
+
 /// A session for `format` that decodes to NV12 and reports into `output`.
-fn open_session(format: &Retained, output: &Mutex<Output>) -> Result<Retained> {
+fn open_session(
+    format: &Retained,
+    output: &Mutex<Output>,
+    specification: Option<&Retained>,
+) -> Result<Retained> {
     let attributes = nv12_attributes()?;
 
     // The record is copied by the call; the pointer inside it is what has to
@@ -603,7 +689,7 @@ fn open_session(format: &Retained, output: &Mutex<Output>) -> Result<Retained> {
         sys::VTDecompressionSessionCreate(
             sys::DEFAULT_ALLOCATOR,
             format.get(),
-            ptr::null(),
+            specification.map_or(ptr::null(), Retained::get),
             attributes.get(),
             &callback,
             &mut session,

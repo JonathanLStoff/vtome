@@ -15,13 +15,20 @@ set -u
 profile="${1:-linux}"
 
 # Always a copy of the source — /src in a container, the checkout on a Mac — so
-# the fixture rebuilt below never replaces the committed one. On a Mac the copy
-# shares the checkout's target directory, so nothing is rebuilt that need not be.
+# the fixture rebuilt below never replaces the committed one.
+#
+# On a Mac the copy builds into a target directory of its own, kept between
+# runs but never shared with the checkout's. Sharing it looked free and was
+# not: the copy's binaries have the copy's path compiled in
+# (`env!("CARGO_MANIFEST_DIR")`), cargo sees byte-identical sources and keeps
+# them, and the next plain `cargo test` in the checkout ran tests that looked
+# for fixtures in a temp directory long since deleted. This matrix is for
+# special occasions; it must never change what `make test` does.
 if [ -d /src ]; then
     source=/src
 else
     source="$(cd "$(dirname "$0")/.." && pwd)"
-    export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-$source/target}"
+    export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-$source/target/docker-macos}"
 fi
 
 work="$(mktemp -d)"

@@ -8,19 +8,21 @@
 //!
 //! # Where the decoders come from
 //!
-//! | Backend | Platform | What it decodes |
+//! vtome reads two encodings, H.264 and AV1 ([`Encoding::is_in_scope`]);
+//! anything else is refused as out of scope before a backend is asked.
+//!
+//! | Backend | Platform | What it decodes for vtome |
 //! |---|---|---|
-//! | VideoToolbox | macOS, iOS | H.264, HEVC, and AV1 on hardware that has it |
-//! | Media Foundation | Windows | H.264, HEVC, VP9, AV1 |
-//! | MediaCodec | Android | whatever the device ships |
+//! | VideoToolbox | macOS, iOS | H.264, and AV1 on hardware that has it |
+//! | Media Foundation | Windows | H.264, AV1 |
+//! | MediaCodec | Android | H.264, and AV1 where the device ships it |
 //! | VA-API | Linux | whatever the driver exposes |
 //! | dav1d | anywhere | AV1, in software |
-//! | libvpx | anywhere | VP9 and VP8, in software |
 //!
 //! The platform decoders come first: they are hardware-accelerated, and the
-//! patent licence for H.264 and HEVC is the operating system's rather than
-//! ours. The software backends are the floor — they are what makes "vtome can
-//! always play what vtome wrote" true everywhere.
+//! patent licence for H.264 is the operating system's rather than ours. dav1d
+//! is the floor — it is what makes "vtome can always play AV1, which it
+//! writes" true everywhere.
 //!
 //! # What is implemented
 //!
@@ -67,6 +69,25 @@ pub trait Decoder: Send {
     fn is_hardware(&self) -> bool;
 }
 
+/// Whether a codec may, must, or must not use dedicated hardware — for
+/// decoding and for encoding alike.
+///
+/// Hardware is faster, cooler, and kinder to a laptop battery; software is
+/// predictable, identical from one GPU vendor to the next, and the way round a
+/// hardware codec that is busy or misbehaving. Either way the codec is the
+/// operating system's for H.264 — Apple's software H.264 encoder is still
+/// Apple's, licence and all.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum Hardware {
+    /// Hardware where the machine has it, software where it does not.
+    #[default]
+    Prefer,
+    /// Hardware or nothing: a clear refusal rather than a quiet slow path.
+    Require,
+    /// Software throughout.
+    Off,
+}
+
 /// Which implementation decodes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 #[non_exhaustive]
@@ -81,14 +102,12 @@ pub enum Backend {
     VaApi,
     /// dav1d, in software, for AV1 anywhere.
     Dav1d,
-    /// libvpx, in software, for VP9/VP8 anywhere.
-    LibVpx,
 }
 
 impl Backend {
     /// Whether this backend uses dedicated hardware.
     pub fn is_hardware(self) -> bool {
-        !matches!(self, Backend::Dav1d | Backend::LibVpx)
+        self != Backend::Dav1d
     }
 
     /// The cargo feature that compiles it in.
@@ -99,26 +118,20 @@ impl Backend {
             | Backend::MediaCodec
             | Backend::VaApi => "decode-platform",
             Backend::Dav1d => "decode-av1",
-            Backend::LibVpx => "decode-vp9",
         }
     }
 
-    /// What it can decode, where it exists.
+    /// What it can decode for vtome, where it exists.
     pub fn handles(self, encoding: Encoding) -> bool {
         match self {
-            // The platform decoders all take the patented pair, which is the
-            // reason to prefer them; what else they take varies by version and
-            // is asked at runtime rather than assumed here.
-            Backend::VideoToolbox | Backend::MediaFoundation | Backend::MediaCodec => matches!(
-                encoding,
-                Encoding::H264 | Encoding::H265 | Encoding::Av1 | Encoding::Vp9
-            ),
-            Backend::VaApi => matches!(
-                encoding,
-                Encoding::H264 | Encoding::H265 | Encoding::Av1 | Encoding::Vp9 | Encoding::Vp8
-            ),
+            // The platform decoders all take H.264, which is the reason to
+            // prefer them; whether one takes AV1 depends on the hardware and is
+            // asked at runtime rather than assumed here.
+            Backend::VideoToolbox
+            | Backend::MediaFoundation
+            | Backend::MediaCodec
+            | Backend::VaApi => matches!(encoding, Encoding::H264 | Encoding::Av1),
             Backend::Dav1d => encoding == Encoding::Av1,
-            Backend::LibVpx => matches!(encoding, Encoding::Vp9 | Encoding::Vp8),
         }
     }
 
@@ -127,7 +140,6 @@ impl Backend {
         let compiled = match self.feature() {
             "decode-platform" => cfg!(feature = "decode-platform"),
             "decode-av1" => cfg!(feature = "decode-av1"),
-            "decode-vp9" => cfg!(feature = "decode-vp9"),
             _ => false,
         };
 
@@ -145,7 +157,7 @@ impl Backend {
                 not(target_vendor = "apple"),
                 not(target_os = "android")
             )),
-            Backend::Dav1d | Backend::LibVpx => true,
+            Backend::Dav1d => true,
         }
     }
 }
@@ -158,7 +170,6 @@ impl std::fmt::Display for Backend {
             Backend::MediaCodec => "MediaCodec",
             Backend::VaApi => "VA-API",
             Backend::Dav1d => "dav1d",
-            Backend::LibVpx => "libvpx",
         };
 
         formatter.write_str(name)
@@ -167,15 +178,14 @@ impl std::fmt::Display for Backend {
 
 /// Every backend, in the order [`open`] tries them.
 ///
-/// Hardware first: it is faster, cooler, and — for H.264 and HEVC — the only
-/// path that does not raise a licensing question. Software backends fill gaps.
-pub const BACKENDS: [Backend; 6] = [
+/// Hardware first: it is faster, cooler, and — for H.264 — the only path that
+/// does not raise a licensing question. Software fills the gaps.
+pub const BACKENDS: [Backend; 5] = [
     Backend::VideoToolbox,
     Backend::MediaFoundation,
     Backend::MediaCodec,
     Backend::VaApi,
     Backend::Dav1d,
-    Backend::LibVpx,
 ];
 
 /// What a decoder needs to know before the first packet.
@@ -238,9 +248,42 @@ pub fn backends_for(encoding: Encoding) -> Vec<Backend> {
 /// platform that would have handled it — the two ways this fails are not the
 /// same problem and should not read alike.
 pub fn open(config: &DecoderConfig) -> Result<Box<dyn Decoder>> {
-    let candidates = backends_for(config.encoding);
+    open_with(config, Hardware::Prefer)
+}
+
+/// [`open`], with a say in whether the decoder runs in hardware.
+///
+/// A platform backend takes the preference itself — VideoToolbox decodes in
+/// hardware or in software as asked. A software-only one, dav1d, is skipped
+/// under [`Hardware::Require`].
+///
+/// # Errors
+///
+/// As [`open`]; and whatever a platform decoder says when it is told to use
+/// hardware the machine does not have.
+pub fn open_with(config: &DecoderConfig, hardware: Hardware) -> Result<Box<dyn Decoder>> {
+    if !config.encoding.is_in_scope() {
+        return Err(Error::NoDecoder {
+            encoding: config.encoding,
+            remedy: out_of_scope(config.encoding),
+        });
+    }
+
+    let candidates: Vec<Backend> = backends_for(config.encoding)
+        .into_iter()
+        .filter(|backend| hardware != Hardware::Require || backend.is_hardware())
+        .collect();
 
     let Some(first) = candidates.first().copied() else {
+        if hardware == Hardware::Require && !backends_for(config.encoding).is_empty() {
+            return Err(Error::NoDecoder {
+                encoding: config.encoding,
+                remedy: "hardware decoding was required, and only a software decoder for it \
+                         is available here"
+                    .to_string(),
+            });
+        }
+
         return Err(Error::NoDecoder {
             encoding: config.encoding,
             remedy: remedy_for(config.encoding),
@@ -253,7 +296,7 @@ pub fn open(config: &DecoderConfig) -> Result<Box<dyn Decoder>> {
     let mut refusal = None;
 
     for backend in candidates {
-        match instantiate(backend, config) {
+        match instantiate(backend, config, hardware) {
             Some(Ok(decoder)) => return Ok(decoder),
             Some(Err(error)) => refusal = Some(error),
             None => {}
@@ -274,11 +317,15 @@ pub fn open(config: &DecoderConfig) -> Result<Box<dyn Decoder>> {
 /// not implemented yet.
 // `config` goes unread in a build with no decoder feature.
 #[allow(unused_variables)]
-fn instantiate(backend: Backend, config: &DecoderConfig) -> Option<Result<Box<dyn Decoder>>> {
+fn instantiate(
+    backend: Backend,
+    config: &DecoderConfig,
+    hardware: Hardware,
+) -> Option<Result<Box<dyn Decoder>>> {
     match backend {
         #[cfg(all(feature = "decode-platform", target_vendor = "apple"))]
         Backend::VideoToolbox => Some(
-            crate::decode_videotoolbox::VideoToolboxDecoder::new(config)
+            crate::decode_videotoolbox::VideoToolboxDecoder::with_hardware(config, hardware)
                 .map(|decoder| Box::new(decoder) as Box<dyn Decoder>),
         ),
 
@@ -288,18 +335,25 @@ fn instantiate(backend: Backend, config: &DecoderConfig) -> Option<Result<Box<dy
                 .map(|decoder| Box::new(decoder) as Box<dyn Decoder>),
         ),
 
-        #[cfg(feature = "decode-vp9")]
-        Backend::LibVpx => Some(
-            crate::decode_vp9::Vp9Decoder::new()
-                .map(|decoder| Box::new(decoder) as Box<dyn Decoder>),
-        ),
-
         _ => None,
     }
 }
 
+/// Why vtome will not read an encoding at all — a scope decision, not a
+/// missing feature, and worded so it does not read like one.
+pub(crate) fn out_of_scope(encoding: Encoding) -> String {
+    format!(
+        "{encoding} is outside vtome's scope: it reads H.264 and AV1 only. Convert it to \
+         one of those with another tool first"
+    )
+}
+
 /// What a person could do about there being no decoder.
 fn remedy_for(encoding: Encoding) -> String {
+    if !encoding.is_in_scope() {
+        return out_of_scope(encoding);
+    }
+
     // Which backends *would* have handled it, had they been compiled in?
     let missing: Vec<Backend> = BACKENDS
         .into_iter()
@@ -391,7 +445,7 @@ mod tests {
         .count();
 
         assert!(platform <= 1, "{platform} platform decoders on one machine");
-        assert!(Backend::Dav1d.exists_here() && Backend::LibVpx.exists_here());
+        assert!(Backend::Dav1d.exists_here());
     }
 
     #[test]
@@ -403,32 +457,42 @@ mod tests {
     #[test]
     fn only_the_platform_backends_offer_the_patented_encodings() {
         assert!(!Backend::Dav1d.handles(Encoding::H264));
-        assert!(!Backend::LibVpx.handles(Encoding::H265));
         assert!(Backend::VideoToolbox.handles(Encoding::H264));
+
+        // Out of scope, so no backend is asked — not even one that could.
+        for backend in BACKENDS {
+            assert!(!backend.handles(Encoding::H265), "{backend}");
+            assert!(!backend.handles(Encoding::Vp9), "{backend}");
+        }
+    }
+
+    /// The error has to distinguish "you did not compile it" from "this machine
+    /// does not have it", because they are different problems.
+    #[test]
+    fn an_out_of_scope_encoding_is_refused_as_a_scope_decision() {
+        for encoding in [Encoding::Vp9, Encoding::H265, Encoding::Theora] {
+            let Err(Error::NoDecoder { remedy, .. }) = open(&config(encoding)) else {
+                panic!("{encoding} is outside vtome's scope");
+            };
+
+            // Not "enable a feature": no feature would help.
+            assert!(remedy.contains("scope"), "{remedy}");
+            assert!(!remedy.contains("feature"), "{remedy}");
+        }
     }
 
     /// The error has to distinguish "you did not compile it" from "this machine
     /// does not have it", because they are different problems.
     #[test]
     fn a_missing_decoder_names_the_feature_that_would_have_supplied_it() {
-        // Use Theora, which no platform/feature supports, to test the error message.
-        // (AV1 might be supported by VideoToolbox on macOS if decode-platform is enabled)
-        let Err(Error::NoDecoder { remedy, .. }) = open(&config(Encoding::Theora)) else {
-            panic!("Theora decoder should not exist");
-        };
+        // dav1d exists everywhere, so AV1 without `decode-av1` is a feature to
+        // turn on rather than a platform to change.
+        if cfg!(feature = "decode-av1") {
+            return;
+        }
 
-        // Should suggest transcoding for unsupported formats
-        assert!(
-            remedy.contains("transcode") || remedy.contains("§2"),
-            "{remedy}"
-        );
-    }
-
-    #[test]
-    fn an_encoding_nothing_here_can_decode_says_to_transcode_instead() {
-        let remedy = remedy_for(Encoding::Theora);
-
-        assert!(remedy.contains("transcode"), "{remedy}");
+        let remedy = remedy_for(Encoding::Av1);
+        assert!(remedy.contains("decode-av1"), "{remedy}");
     }
 
     #[test]
@@ -458,11 +522,7 @@ mod tests {
     fn nothing_is_available_without_its_feature() {
         // The default build turns none of the decoder features on, so this is
         // the honest state of the crate today.
-        if !cfg!(any(
-            feature = "decode-av1",
-            feature = "decode-vp9",
-            feature = "decode-platform"
-        )) {
+        if !cfg!(any(feature = "decode-av1", feature = "decode-platform")) {
             assert!(backends_for(Encoding::Av1).is_empty());
             assert!(backends_for(Encoding::H264).is_empty());
         }

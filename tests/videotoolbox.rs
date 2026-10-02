@@ -161,7 +161,7 @@ fn the_colours_survive_decoding() {
 /// decoder, and queueing frames.
 #[test]
 fn a_video_source_plays_the_whole_file() {
-    let mut source = VideoSource::from_file(FIXTURE, None).expect("the fixture opens");
+    let mut source = VideoSource::from_file(FIXTURE).expect("the fixture opens");
     let mut shown = Vec::new();
 
     while !source.is_finished() {
@@ -180,7 +180,7 @@ fn a_video_source_plays_the_whole_file() {
 /// emptied, and the same pictures again in the same order.
 #[test]
 fn a_rewound_source_plays_the_same_film_again() {
-    let mut source = VideoSource::from_file(FIXTURE, None).unwrap();
+    let mut source = VideoSource::from_file(FIXTURE).unwrap();
 
     let play = |source: &mut VideoSource| {
         let mut bars = Vec::new();
@@ -259,4 +259,181 @@ fn decoded_frames_draw_in_colour_through_the_gpu() {
     // Frame 5's moving bar is centred at 12 + 4·5.
     assert!(close(at(32, HEIGHT * 3 / 4), [255, 255, 255], 24), "the bar is not white");
     assert!(close(at(80, HEIGHT * 3 / 4), [0, 0, 0], 24), "the background is not black");
+}
+
+/// Hardware is a choice, not a guess: off means Apple's software decoder,
+/// with the same pictures in the same order; required means hardware or a
+/// refusal that says so.
+#[test]
+fn hardware_decoding_can_be_ruled_out_or_required() {
+    use vtome::decode::Hardware;
+
+    let mut demuxer = vtome::open_media(FIXTURE).unwrap();
+    let track = demuxer.info().video().unwrap().clone();
+    let config = DecoderConfig::from_track(&track).unwrap();
+
+    let mut software = decode::open_with(&config, Hardware::Off).expect("software decoding opens");
+    assert!(!software.is_hardware(), "asked for software, got hardware");
+
+    let mut frames = Vec::new();
+    while let Some(packet) = demuxer.next_packet().unwrap() {
+        if packet.track_id == track.id {
+            frames.extend(software.decode(&packet).unwrap());
+        }
+    }
+    frames.extend(software.flush().unwrap());
+
+    assert_eq!(frames.len(), FRAMES);
+    let centres: Vec<f64> = frames.iter().map(bar_centre).collect();
+    assert!(centres.windows(2).all(|pair| pair[1] > pair[0]), "{centres:?}");
+
+    match decode::open_with(&config, Hardware::Require) {
+        Ok(decoder) => assert!(decoder.is_hardware()),
+        Err(vtome::Error::NoDecoder { remedy, .. }) => assert!(remedy.contains("hardware"), "{remedy}"),
+        Err(other) => panic!("required hardware failed some other way: {other}"),
+    }
+}
+
+/// Every frame a source hands out, in order, until it is finished.
+fn drain(source: &mut VideoSource) -> Vec<Frame> {
+    let mut frames = Vec::new();
+
+    loop {
+        source.advance(Duration::ZERO).unwrap();
+        match source.pop_frame() {
+            Some(frame) => frames.push(frame),
+            None if source.is_finished() => return frames,
+            None => {}
+        }
+    }
+}
+
+/// A seek lands on the frame asked for, not on the keyframe before it.
+#[test]
+fn a_seek_lands_on_the_exact_frame() {
+    let mut source = VideoSource::from_file(FIXTURE).unwrap();
+    let all = drain(&mut source);
+    let frame = source.frame_duration().expect("24 fps");
+
+    // The fixture's B-frames start its first picture a frame in, so frame
+    // numbers count from there.
+    let origin = source.origin().unwrap();
+    assert_eq!(origin, all[0].pts());
+
+    source.seek(origin + frame * 10).unwrap();
+    let after = drain(&mut source);
+
+    assert_eq!(after.len(), FRAMES - 10, "frames 10 to 23");
+    assert_eq!(bar_centre(&after[0]), bar_centre(&all[10]));
+}
+
+/// Cached ranges come from memory and the rest from the decoder, and the
+/// film plays through the joins without a frame missing, repeated, or out of
+/// place.
+#[test]
+fn a_cached_film_plays_the_same_pictures_through_the_joins() {
+    let mut plain = VideoSource::from_file(FIXTURE).unwrap();
+    let expected: Vec<f64> = drain(&mut plain).iter().map(bar_centre).collect();
+
+    let ranges = [(0, 6), (12, 15)];
+    let frames = vtome::cache_frames(FIXTURE, &ranges).expect("the ranges decode");
+    assert_eq!(frames.len(), 9);
+
+    // Mark the cached pictures, so it is visible which ones came from memory:
+    // the moving bar is left alone, the top-left corner is not.
+    let marked: Vec<Frame> = frames.iter().map(|frame| mark(frame)).collect();
+
+    let mut source = VideoSource::from_file(FIXTURE).unwrap();
+    source
+        .set_cache(vtome::FrameCache::new(ranges.to_vec(), marked).unwrap())
+        .unwrap();
+
+    let played = drain(&mut source);
+    let centres: Vec<f64> = played.iter().map(bar_centre).collect();
+
+    assert_eq!(centres, expected, "the same pictures, in the same order");
+
+    let from_memory: Vec<usize> = played
+        .iter()
+        .enumerate()
+        .filter(|(_, frame)| frame.row(0, 0).unwrap()[0] == 7)
+        .map(|(index, _)| index)
+        .collect();
+    assert_eq!(from_memory, [0, 1, 2, 3, 4, 5, 12, 13, 14]);
+
+    // And retimed to where they belong.
+    let frame = source.frame_duration().unwrap();
+    let origin = source.origin().unwrap();
+    for (index, picture) in played.iter().enumerate() {
+        let due = origin + frame * index as u32;
+        assert!(picture.pts().abs_diff(due) < Duration::from_millis(2), "frame {index}");
+    }
+
+    // Rewinding goes back to memory for the start.
+    source.rewind().unwrap();
+    let again = drain(&mut source);
+    assert_eq!(again.len(), FRAMES);
+    assert_eq!(again[0].row(0, 0).unwrap()[0], 7);
+}
+
+/// The frame with its first luma sample set to 7: a mark no decoded frame of
+/// the fixture carries in its top-left corner.
+fn mark(frame: &Frame) -> Frame {
+    let mut data = frame.data().to_vec();
+    let offset = frame.planes()[0].offset;
+    data[offset] = 7;
+
+    Frame::with_planes(
+        frame.width(),
+        frame.height(),
+        frame.format(),
+        frame.color(),
+        frame.pts(),
+        frame.planes().to_vec(),
+        data,
+    )
+    .unwrap()
+}
+
+/// `Clip::start_at` underneath: nothing shown until the timeline reaches the
+/// start, then the film from its first frame.
+#[test]
+fn a_film_started_at_a_point_on_the_timeline_waits_for_it() {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::Arc;
+    use vtome::{Compositor, MasterClock};
+
+    #[derive(Default)]
+    struct Hand(AtomicU64);
+
+    impl MasterClock for Hand {
+        fn position(&self) -> Duration {
+            Duration::from_millis(self.0.load(Ordering::Relaxed))
+        }
+    }
+
+    let timeline = Arc::new(Hand::default());
+    let mut compositor = Compositor::with_clock(timeline.clone());
+
+    compositor.insert_video_at(
+        "late",
+        VideoSource::from_file(FIXTURE).unwrap(),
+        false,
+        Some(Duration::from_secs(5)),
+    );
+
+    timeline.0.store(4_900, Ordering::Relaxed);
+    assert!(compositor.tick().is_empty());
+    assert!(compositor.showing("late").is_none(), "not due yet");
+
+    timeline.0.store(5_000, Ordering::Relaxed);
+    compositor.tick();
+    let first = compositor.showing("late").expect("due now").pts();
+    let mut plain = VideoSource::from_file(FIXTURE).unwrap();
+    assert_eq!(first, plain.origin().unwrap(), "from the first frame");
+
+    // Half a second on: about frame 12.
+    timeline.0.store(5_500, Ordering::Relaxed);
+    compositor.tick();
+    assert_eq!(compositor.position("late"), Some(Duration::from_millis(500)));
 }

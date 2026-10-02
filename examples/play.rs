@@ -31,7 +31,7 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     // Opening the source is where "nothing decodes this" surfaces — before any
     // overlay exists to be left blank.
-    let source = VideoSource::from_file(&path, None)?;
+    let source = VideoSource::from_file(&path)?;
 
     if let Some(track) = source.info().video() {
         println!(

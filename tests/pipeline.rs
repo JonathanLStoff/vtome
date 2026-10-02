@@ -197,16 +197,17 @@ fn playback_follows_an_external_clock() {
 /// Only the royalty-free encodings can be written. This is the crate's reason
 /// for existing, asserted from outside so that it cannot quietly change.
 #[test]
-fn nothing_patent_encumbered_is_ever_encodable() {
+fn only_h264_and_av1_are_ever_encodable() {
     use vtome::Encoding;
 
-    for encoding in [Encoding::H264, Encoding::H265, Encoding::ProRes] {
+    for encoding in [Encoding::H265, Encoding::ProRes, Encoding::Vp9] {
         assert!(!encoding.is_encodable(), "{encoding} must not be written");
     }
 
-    // AV1 is the one format vtome writes. VP9 is royalty-free too, and still
-    // not written: one output format.
+    // AV1 through the bundled rav1e; H.264 only through the OS encoder, whose
+    // vendor holds the licence. VP9 is royalty-free too, and out of scope.
     assert!(Encoding::Av1.is_encodable() && Encoding::Av1.is_royalty_free());
+    assert!(Encoding::H264.is_encodable() && !Encoding::H264.is_royalty_free());
     assert!(!Encoding::Vp9.is_encodable() && Encoding::Vp9.is_royalty_free());
 }
 

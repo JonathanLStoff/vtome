@@ -17,7 +17,7 @@ use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::window::{Window, WindowId, WindowLevel};
 
 use crate::engine::{
-    self, Clip, ClipId, Command, Controls, Core, Hold, OutputRect, Planned, Screen, Shared,
+    self, Audio, Clip, ClipId, Command, Controls, Core, Hold, OutputRect, Planned, Screen, Shared,
 };
 use crate::error::{Error, Result};
 use crate::placement::Monitor;
@@ -43,7 +43,9 @@ use crate::render::Gpu;
 /// let outputs = HashMap::from([("monitor_342b0e446031e910".to_string(), (1920, 1080, 0, 0))]);
 /// let backgrounds = HashMap::from([("monitor_342b0e446031e910".to_string(), "#000000FF".to_string())]);
 ///
-/// vtome.start(outputs, backgrounds)?; // runs until `controls.close()`
+/// // No audio: vtome keeps its own clock. `Audio::atome(output.clock())`
+/// // would have every clip follow atome's output instead.
+/// vtome.start(outputs, backgrounds, vtome::Audio::Off)?; // runs until `controls.close()`
 /// # Ok::<(), vtome::Error>(())
 /// ```
 ///
@@ -135,9 +137,55 @@ impl Vtome {
         self.controls.add_frame(frame, monitor, hold)
     }
 
+    /// [`Controls::add_generic`]: any file, on a monitor's whole output.
+    ///
+    /// # Errors
+    ///
+    /// As [`Controls::add_generic`].
+    pub fn add_generic(
+        &self,
+        path: impl Into<std::path::PathBuf>,
+        monitor: impl Into<String>,
+    ) -> Result<ClipId> {
+        self.controls.add_generic(path, monitor)
+    }
+
+    /// [`Controls::add_cached`]: a video with ranges of it served from memory.
+    ///
+    /// # Errors
+    ///
+    /// As [`Controls::add_cached`].
+    pub fn add_cached(
+        &self,
+        clip: Clip,
+        ranges: Vec<(u64, u64)>,
+        frames: Vec<crate::frame::Frame>,
+    ) -> Result<ClipId> {
+        self.controls.add_cached(clip, ranges, frames)
+    }
+
     /// [`Controls::stop`], from the thread that holds the engine.
     pub fn stop(&self, id: ClipId) -> bool {
         self.controls.stop(id)
+    }
+
+    /// [`Controls::is_running`].
+    pub fn is_running(&self, id: ClipId) -> bool {
+        self.controls.is_running(id)
+    }
+
+    /// [`Controls::is_finished`].
+    pub fn is_finished(&self, id: ClipId) -> bool {
+        self.controls.is_finished(id)
+    }
+
+    /// [`Controls::snapshot`]: the picture a clip is showing now.
+    ///
+    /// # Errors
+    ///
+    /// As [`Controls::snapshot`].
+    pub fn snapshot(&self, id: ClipId) -> Result<crate::frame::Frame> {
+        self.controls.snapshot(id)
     }
 
     /// Opens an output on every monitor in `outputs` that is attached and not
@@ -149,6 +197,9 @@ impl Vtome {
     /// monitor with no background is transparent. Monitors left out, and why,
     /// are in [`Controls::skipped_monitors`].
     ///
+    /// `audio` is where time comes from: [`Audio::Off`] for vtome's own clock,
+    /// or atome's output clock so every clip follows the sound.
+    ///
     /// # Errors
     ///
     /// [`Error::NoSuchMonitor`] if none of `outputs` can be opened; a
@@ -159,12 +210,13 @@ impl Vtome {
         &mut self,
         outputs: HashMap<String, OutputRect>,
         backgrounds: HashMap<String, String>,
+        audio: Audio,
     ) -> Result<()> {
-        self.start_with(move |_| (outputs, backgrounds))
+        self.start_with(audio, move |_| (outputs, backgrounds))
     }
 
     /// [`start`](Vtome::start), with the outputs chosen once the attached
-    /// monitors are known.
+    /// monitors are known — the list of monitors a start hands back.
     ///
     /// An event loop is the only way to ask about monitors, and it runs once,
     /// so a program that needs monitor ids before it can say which outputs it
@@ -173,7 +225,7 @@ impl Vtome {
     /// # Errors
     ///
     /// As [`start`](Vtome::start).
-    pub fn start_with<F>(&mut self, choose: F) -> Result<()>
+    pub fn start_with<F>(&mut self, audio: Audio, choose: F) -> Result<()>
     where
         F: FnOnce(&[Monitor]) -> (HashMap<String, OutputRect>, HashMap<String, String>) + 'static,
     {
@@ -187,6 +239,7 @@ impl Vtome {
 
         let mut host = Host {
             choose: Some(Box::new(choose)),
+            audio,
             excluded: self.excluded.clone(),
             click_through: self.click_through,
             commands: Some(commands),
@@ -218,6 +271,7 @@ type Choose = Box<dyn FnOnce(&[Monitor]) -> (HashMap<String, OutputRect>, HashMa
 /// The event loop's side of a running [`Vtome`].
 struct Host {
     choose: Option<Choose>,
+    audio: Audio,
     excluded: HashSet<String>,
     click_through: bool,
     commands: Option<Receiver<Command>>,
@@ -279,7 +333,14 @@ impl Host {
             .take()
             .ok_or_else(|| Error::unsupported("the engine was already opened"))?;
 
-        Core::new(gpu, &plans, screens, commands, Arc::clone(&self.shared))
+        Core::new(
+            gpu,
+            &plans,
+            screens,
+            commands,
+            Arc::clone(&self.shared),
+            &self.audio,
+        )
     }
 
     /// One output's window: borderless, see-through, above everything, and

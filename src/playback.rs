@@ -9,7 +9,7 @@
 
 use std::time::Duration;
 
-use crate::clock::{Action, Clock, MasterClock, Pacing};
+use crate::clock::{Action, Follower, MasterClock, Pacing, SharedClock};
 use crate::error::{Error, Result};
 use crate::frame::Frame;
 use crate::video_source::VideoSource;
@@ -17,13 +17,16 @@ use crate::video_source::VideoSource;
 /// A film while it plays.
 pub(crate) struct Playback {
     source: VideoSource,
-    clock: Clock,
+    /// The film's position, on whichever timeline it was given — the engine's,
+    /// which is atome's when there is audio.
+    clock: Follower,
     pacing: Pacing,
     /// Start again at the end, or finish.
     pub(crate) looping: bool,
-    /// Whether the clock has started. It waits for the first picture to be on
-    /// screen, so opening the GPU, filling the queue, and a window appearing
-    /// are not counted against the film's first second.
+    /// Whether the clock has started. Unless the film was given a start on the
+    /// timeline, it waits for the first picture to be on screen, so opening
+    /// the GPU, filling the queue, and a window appearing are not counted
+    /// against the film's first second.
     started: bool,
     draws_before_start: u8,
     /// The first picture's timestamp. An MP4 with B-frames starts a frame or
@@ -47,15 +50,29 @@ pub(crate) enum Tick {
 }
 
 impl Playback {
-    pub(crate) fn new(source: VideoSource, looping: bool) -> Self {
+    /// A film on `timeline`, starting once its first picture is on screen —
+    /// or, with `start_at`, exactly when the timeline reaches that point, and
+    /// showing nothing until then. That is how a picture lines up with a sound
+    /// scheduled in atome for the same moment.
+    pub(crate) fn new(
+        source: VideoSource,
+        looping: bool,
+        timeline: SharedClock,
+        start_at: Option<Duration>,
+    ) -> Self {
         let rate = source.info().video().and_then(|track| track.frame_rate);
+
+        let clock = match start_at {
+            Some(at) => Follower::starting_at(timeline, at),
+            None => Follower::new(timeline),
+        };
 
         Playback {
             source,
-            clock: Clock::new(),
+            clock,
             pacing: Pacing::for_frame_rate(rate.map_or(25.0, |rate| rate.as_f64())),
             looping,
-            started: false,
+            started: start_at.is_some(),
             draws_before_start: 0,
             origin: None,
             showing: None,
@@ -97,9 +114,20 @@ impl Playback {
         self.loops
     }
 
+    /// Where the film is, on its own clock.
+    pub(crate) fn position(&self) -> Duration {
+        self.clock.position()
+    }
+
     /// Decodes ahead and decides what this refresh shows.
     pub(crate) fn tick(&mut self) -> Result<Tick> {
         self.source.advance(Duration::ZERO)?;
+
+        // Given a start on the timeline that is still ahead: decode ready,
+        // show nothing.
+        if !self.clock.is_due() {
+            return Ok(Tick::Hold);
+        }
 
         let origin = *self
             .origin
@@ -185,7 +213,7 @@ impl Playback {
             return;
         }
 
-        if self.clock.is_running() {
+        if self.clock.is_playing() {
             self.clock.pause();
         } else {
             self.clock.play();

@@ -61,12 +61,28 @@ pub enum Error {
         reason: String,
     },
 
+    /// Nothing in this build can encode that encoding on this machine — or
+    /// not in the way asked, such as in hardware where there is none.
+    #[error("no encoder for {encoding}: {remedy}")]
+    NoEncoder {
+        /// The encoding that went unwritten.
+        encoding: Encoding,
+        /// The feature to enable, the platform that would have done it, or
+        /// the setting that ruled every encoder out.
+        remedy: String,
+    },
+
     /// An encoder failed.
     #[error("encoding: {reason}")]
     Encode {
         /// What the encoder said.
         reason: String,
     },
+
+    /// A job was cancelled before it finished. Not a failure: what was asked
+    /// to stop, stopped.
+    #[error("cancelled")]
+    Cancelled,
 
     /// A frame's planes do not describe a picture of that size.
     #[error("{reason}")]

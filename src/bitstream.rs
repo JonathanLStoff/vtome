@@ -267,6 +267,387 @@ pub fn annex_b_units(data: &[u8]) -> impl Iterator<Item = &[u8]> {
         .map(move |(start, end)| &data[start..end])
 }
 
+impl AvcConfig {
+    /// One SPS and one PPS with four-byte lengths — what an encoder hands
+    /// back and what MP4 stores.
+    pub fn new(sps: Vec<u8>, pps: Vec<u8>) -> Self {
+        AvcConfig {
+            nal_length_size: 4,
+            sequence_parameter_sets: vec![sps],
+            picture_parameter_sets: vec![pps],
+        }
+    }
+
+    /// Back into an `avcC` record: what [`TrackInfo::extra_data`] holds for
+    /// H.264, whichever container the parameter sets came out of.
+    ///
+    /// [`TrackInfo::extra_data`]: crate::media::TrackInfo::extra_data
+    pub fn to_record(&self) -> Vec<u8> {
+        let Some(sps) = self.sequence_parameter_sets.first().filter(|sps| sps.len() >= 4) else {
+            return Vec::new();
+        };
+
+        let mut record = vec![
+            1,      // configuration version
+            sps[1], // profile
+            sps[2], // compatibility
+            sps[3], // level
+            // Reserved ones, then the length size less one.
+            0xFC | (self.nal_length_size.clamp(1, 4) as u8 - 1),
+            0xE0 | (self.sequence_parameter_sets.len().min(31) as u8),
+        ];
+
+        for set in self.sequence_parameter_sets.iter().take(31) {
+            record.extend_from_slice(&(set.len() as u16).to_be_bytes());
+            record.extend_from_slice(set);
+        }
+
+        record.push(self.picture_parameter_sets.len().min(255) as u8);
+
+        for set in self.picture_parameter_sets.iter().take(255) {
+            record.extend_from_slice(&(set.len() as u16).to_be_bytes());
+            record.extend_from_slice(set);
+        }
+
+        record
+    }
+}
+
+/// What an H.264 sequence parameter set says about the pictures under it.
+///
+/// Read for two reasons. The colour description: an MP4 says nothing about
+/// colour unless it carries a `colr` box, which most do not, and the SPS's
+/// video usability information is where the encoder wrote it — reading it is
+/// the difference between the right matrix and a guess by resolution, and the
+/// guess calls a 640×360 proxy of a BT.709 film BT.601. And the reorder depth,
+/// which says how many pictures a decoder must hold before display order is
+/// settled.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SequenceParameterSet {
+    /// 66 baseline, 77 main, 100 high, and so on.
+    pub profile_idc: u8,
+    /// Ten times the level: 41 is level 4.1.
+    pub level_idc: u8,
+    /// 0 monochrome, 1 4:2:0, 2 4:2:2, 3 4:4:4.
+    pub chroma_format_idc: u32,
+    /// Luma bit depth.
+    pub bit_depth: u32,
+    /// Picture width once the cropping window is applied.
+    pub width: u32,
+    /// Picture height once the cropping window is applied.
+    pub height: u32,
+    /// Whether full-range samples were signalled, where the encoder said.
+    pub full_range: Option<bool>,
+    /// H.273 `colour_primaries`, where the encoder said.
+    pub primaries: Option<u8>,
+    /// H.273 `transfer_characteristics`, where the encoder said.
+    pub transfer: Option<u8>,
+    /// H.273 `matrix_coefficients`, where the encoder said.
+    pub matrix: Option<u8>,
+    /// How many pictures may come out of order — 0 for a stream without
+    /// B-frames — where the encoder said.
+    pub max_num_reorder_frames: Option<u32>,
+}
+
+impl SequenceParameterSet {
+    /// Parses an SPS NAL unit, header byte included.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Decode`] for something that is not an SPS, or one that ends
+    /// before the picture size. A video usability section cut short is not an
+    /// error: what was read before the cut is kept.
+    pub fn parse(nal: &[u8]) -> Result<Self> {
+        let Some((&header, payload)) = nal.split_first() else {
+            return Err(malformed("an empty NAL unit is not a sequence parameter set"));
+        };
+
+        if header & 0x1F != 7 {
+            return Err(malformed(format!(
+                "NAL unit type {} is not a sequence parameter set (7)",
+                header & 0x1F
+            )));
+        }
+
+        let rbsp = unescape(payload);
+        let mut bits = Bits::new(&rbsp);
+        let short = |_| malformed("the sequence parameter set ends before the picture size");
+
+        let profile_idc = bits.u(8).map_err(short)? as u8;
+        bits.u(8).map_err(short)?; // constraint flags and reserved bits
+        let level_idc = bits.u(8).map_err(short)? as u8;
+        bits.ue().map_err(short)?; // seq_parameter_set_id
+
+        let mut chroma_format_idc = 1;
+        let mut separate_colour_plane = false;
+        let mut bit_depth = 8;
+
+        if matches!(
+            profile_idc,
+            100 | 110 | 122 | 244 | 44 | 83 | 86 | 118 | 128 | 138 | 139 | 134 | 135
+        ) {
+            chroma_format_idc = bits.ue().map_err(short)?;
+            if chroma_format_idc == 3 {
+                separate_colour_plane = bits.flag().map_err(short)?;
+            }
+            bit_depth = 8 + bits.ue().map_err(short)?;
+            bits.ue().map_err(short)?; // bit_depth_chroma_minus8
+            bits.flag().map_err(short)?; // qpprime_y_zero_transform_bypass
+
+            if bits.flag().map_err(short)? {
+                let lists = if chroma_format_idc == 3 { 12 } else { 8 };
+                for list in 0..lists {
+                    if bits.flag().map_err(short)? {
+                        bits.skip_scaling_list(if list < 6 { 16 } else { 64 })
+                            .map_err(short)?;
+                    }
+                }
+            }
+        }
+
+        bits.ue().map_err(short)?; // log2_max_frame_num_minus4
+
+        match bits.ue().map_err(short)? {
+            0 => {
+                bits.ue().map_err(short)?; // log2_max_pic_order_cnt_lsb_minus4
+            }
+            1 => {
+                bits.flag().map_err(short)?; // delta_pic_order_always_zero
+                bits.se().map_err(short)?; // offset_for_non_ref_pic
+                bits.se().map_err(short)?; // offset_for_top_to_bottom_field
+                let cycle = bits.ue().map_err(short)?;
+                for _ in 0..cycle.min(255) {
+                    bits.se().map_err(short)?;
+                }
+            }
+            _ => {}
+        }
+
+        bits.ue().map_err(short)?; // max_num_ref_frames
+        bits.flag().map_err(short)?; // gaps_in_frame_num_value_allowed
+
+        let width_in_mbs = bits.ue().map_err(short)? + 1;
+        let height_in_map_units = bits.ue().map_err(short)? + 1;
+        let frame_mbs_only = bits.flag().map_err(short)?;
+        if !frame_mbs_only {
+            bits.flag().map_err(short)?; // mb_adaptive_frame_field
+        }
+        bits.flag().map_err(short)?; // direct_8x8_inference
+
+        let mut crop = [0_u32; 4];
+        if bits.flag().map_err(short)? {
+            for edge in &mut crop {
+                *edge = bits.ue().map_err(short)?;
+            }
+        }
+
+        // The cropping window is in chroma samples, and in field pairs for
+        // interlaced streams.
+        let chroma_array_type = if separate_colour_plane { 0 } else { chroma_format_idc };
+        let field = 2 - u32::from(frame_mbs_only);
+        let (crop_x, crop_y) = match chroma_array_type {
+            0 => (1, field),
+            1 => (2, 2 * field),
+            2 => (2, field),
+            _ => (1, field),
+        };
+
+        let width = (width_in_mbs * 16).saturating_sub(crop_x * (crop[0] + crop[1]));
+        let height = (field * height_in_map_units * 16).saturating_sub(crop_y * (crop[2] + crop[3]));
+
+        let mut sps = SequenceParameterSet {
+            profile_idc,
+            level_idc,
+            chroma_format_idc,
+            bit_depth,
+            width,
+            height,
+            full_range: None,
+            primaries: None,
+            transfer: None,
+            matrix: None,
+            max_num_reorder_frames: None,
+        };
+
+        // Video usability information. Cut short is not malformed — plenty of
+        // encoders write a truncated VUI — so whatever was read stays.
+        if bits.flag().unwrap_or(false) {
+            let _ = sps.read_vui(&mut bits);
+        }
+
+        Ok(sps)
+    }
+
+    /// The part of the VUI this crate uses, in the order the syntax has it.
+    fn read_vui(&mut self, bits: &mut Bits<'_>) -> std::result::Result<(), Short> {
+        if bits.flag()? {
+            // aspect_ratio_idc, and the explicit ratio when it is 255.
+            if bits.u(8)? == 255 {
+                bits.u(16)?;
+                bits.u(16)?;
+            }
+        }
+
+        if bits.flag()? {
+            bits.flag()?; // overscan_appropriate
+        }
+
+        if bits.flag()? {
+            bits.u(3)?; // video_format
+            self.full_range = Some(bits.flag()?);
+
+            if bits.flag()? {
+                self.primaries = Some(bits.u(8)? as u8);
+                self.transfer = Some(bits.u(8)? as u8);
+                self.matrix = Some(bits.u(8)? as u8);
+            }
+        }
+
+        if bits.flag()? {
+            bits.ue()?; // chroma_sample_loc_type_top_field
+            bits.ue()?; // chroma_sample_loc_type_bottom_field
+        }
+
+        if bits.flag()? {
+            bits.u(32)?; // num_units_in_tick
+            bits.u(32)?; // time_scale
+            bits.flag()?; // fixed_frame_rate
+        }
+
+        let nal_hrd = bits.flag()?;
+        if nal_hrd {
+            bits.skip_hrd()?;
+        }
+        let vcl_hrd = bits.flag()?;
+        if vcl_hrd {
+            bits.skip_hrd()?;
+        }
+        if nal_hrd || vcl_hrd {
+            bits.flag()?; // low_delay_hrd
+        }
+
+        bits.flag()?; // pic_struct_present
+
+        if bits.flag()? {
+            bits.flag()?; // motion_vectors_over_pic_boundaries
+            bits.ue()?; // max_bytes_per_pic_denom
+            bits.ue()?; // max_bits_per_mb_denom
+            bits.ue()?; // log2_max_mv_length_horizontal
+            bits.ue()?; // log2_max_mv_length_vertical
+            self.max_num_reorder_frames = Some(bits.ue()?);
+        }
+
+        Ok(())
+    }
+}
+
+/// Removes emulation-prevention bytes: the `03` an encoder puts after every
+/// `00 00` so the payload never contains a start code.
+fn unescape(data: &[u8]) -> Vec<u8> {
+    let mut output = Vec::with_capacity(data.len());
+    let mut zeros = 0;
+
+    for &byte in data {
+        if zeros >= 2 && byte == 3 {
+            zeros = 0;
+            continue;
+        }
+
+        zeros = if byte == 0 { zeros + 1 } else { 0 };
+        output.push(byte);
+    }
+
+    output
+}
+
+/// Ran out of bits.
+#[derive(Debug)]
+struct Short;
+
+/// A reader of the fixed-width and Exp-Golomb fields H.264 headers are made of.
+struct Bits<'a> {
+    data: &'a [u8],
+    position: usize,
+}
+
+impl<'a> Bits<'a> {
+    fn new(data: &'a [u8]) -> Self {
+        Bits { data, position: 0 }
+    }
+
+    fn bit(&mut self) -> std::result::Result<u32, Short> {
+        let byte = self.data.get(self.position / 8).ok_or(Short)?;
+        let bit = (byte >> (7 - self.position % 8)) & 1;
+        self.position += 1;
+        Ok(u32::from(bit))
+    }
+
+    fn flag(&mut self) -> std::result::Result<bool, Short> {
+        Ok(self.bit()? == 1)
+    }
+
+    /// `u(n)`, up to 32 bits.
+    fn u(&mut self, count: u32) -> std::result::Result<u32, Short> {
+        let mut value = 0_u64;
+        for _ in 0..count {
+            value = (value << 1) | u64::from(self.bit()?);
+        }
+        Ok(value as u32)
+    }
+
+    /// `ue(v)`: unsigned Exp-Golomb.
+    fn ue(&mut self) -> std::result::Result<u32, Short> {
+        let mut zeros = 0;
+        while self.bit()? == 0 {
+            zeros += 1;
+            // 32 leading zeros is not a value any header field holds.
+            if zeros > 31 {
+                return Err(Short);
+            }
+        }
+
+        let rest = self.u(zeros)?;
+        Ok(((1_u64 << zeros) - 1 + u64::from(rest)) as u32)
+    }
+
+    /// `se(v)`: signed Exp-Golomb.
+    fn se(&mut self) -> std::result::Result<i32, Short> {
+        let code = i64::from(self.ue()?);
+        Ok(if code % 2 == 1 { (code + 1) / 2 } else { -code / 2 } as i32)
+    }
+
+    fn skip_scaling_list(&mut self, size: usize) -> std::result::Result<(), Short> {
+        let (mut last, mut next) = (8_i32, 8_i32);
+
+        for _ in 0..size {
+            if next != 0 {
+                next = (last + self.se()? + 256) % 256;
+            }
+            if next != 0 {
+                last = next;
+            }
+        }
+
+        Ok(())
+    }
+
+    fn skip_hrd(&mut self) -> std::result::Result<(), Short> {
+        let count = self.ue()? + 1;
+        self.u(4)?; // bit_rate_scale
+        self.u(4)?; // cpb_size_scale
+        for _ in 0..count.min(32) {
+            self.ue()?; // bit_rate_value_minus1
+            self.ue()?; // cpb_size_value_minus1
+            self.flag()?; // cbr
+        }
+        self.u(5)?; // initial_cpb_removal_delay_length_minus1
+        self.u(5)?; // cpb_removal_delay_length_minus1
+        self.u(5)?; // dpb_output_delay_length_minus1
+        self.u(5)?; // time_offset_length
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -288,6 +669,38 @@ mod tests {
         record.extend_from_slice(&[0x68, 0xEE, 0x38]);
 
         record
+    }
+
+    /// `1`, `010`, `011`, `00100`: 0, 1, 2, 3 — and the signed mapping
+    /// alternates 1, -1, 2.
+    #[test]
+    fn exp_golomb_reads_both_ways() {
+        // 1 010 011 00100 010 011 00100 → ue 0 1 2 3, then se 1 -1 2.
+        let data = [0b1010_0110, 0b0100_0100, 0b1100_1000];
+        let mut bits = Bits::new(&data);
+
+        assert_eq!(bits.ue().unwrap(), 0);
+        assert_eq!(bits.ue().unwrap(), 1);
+        assert_eq!(bits.ue().unwrap(), 2);
+        assert_eq!(bits.ue().unwrap(), 3);
+        assert_eq!(bits.se().unwrap(), 1);
+        assert_eq!(bits.se().unwrap(), -1);
+        assert_eq!(bits.se().unwrap(), 2);
+        assert!(bits.u(8).is_err(), "out of bits");
+    }
+
+    /// The `03` after two zeros is the encoder's, not the payload's.
+    #[test]
+    fn emulation_prevention_bytes_are_removed() {
+        assert_eq!(unescape(&[0, 0, 3, 1, 0, 0, 3, 0, 7]), [0, 0, 1, 0, 0, 0, 7]);
+        assert_eq!(unescape(&[0, 3, 0, 3]), [0, 3, 0, 3], "one zero is not two");
+    }
+
+    #[test]
+    fn only_a_sequence_parameter_set_is_parsed_as_one() {
+        assert!(SequenceParameterSet::parse(&[0x68, 0xEE]).is_err(), "a PPS");
+        assert!(SequenceParameterSet::parse(&[]).is_err());
+        assert!(SequenceParameterSet::parse(&[0x67, 0x64]).is_err(), "cut short");
     }
 
     #[test]

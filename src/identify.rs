@@ -134,15 +134,19 @@ impl fmt::Display for Container {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum Encoding {
-    /// H.264 / AVC. Patent-pooled: decodable through the OS, never written.
+    /// H.264 / AVC. Patent-pooled, so it is only ever handled by the operating
+    /// system's own codec — read through its decoder, and written, by
+    /// default, through its encoder. Never by one bundled here.
     H264,
-    /// H.265 / HEVC. Patent-pooled twice over, for the same treatment.
+    /// H.265 / HEVC. Identified, and outside vtome's scope.
     H265,
-    /// AV1. Royalty-free, and what vtome writes by default.
+    /// AV1. Royalty-free; read everywhere, and written by the bundled `rav1e`
+    /// wherever the OS has no H.264 encoder, or when asked for.
     Av1,
-    /// VP9. Royalty-free, and the fallback for hardware that predates AV1.
+    /// VP9. Royalty-free, and outside vtome's scope: identified so it can be
+    /// refused by name.
     Vp9,
-    /// VP8. Royalty-free, superseded by VP9.
+    /// VP8. As VP9.
     Vp8,
     /// Theora. Royalty-free and obsolete; identified, not decoded.
     Theora,
@@ -159,9 +163,9 @@ pub enum Encoding {
 impl Encoding {
     /// Whether using this costs a licence fee.
     ///
-    /// The whole reason this crate exists: everything it *writes* answers true
-    /// here, and everything that answers false is read through a decoder the
-    /// operating system already licensed.
+    /// The whole reason this crate exists: anything that answers false here is
+    /// only ever handled by a codec the operating system already licensed —
+    /// never one compiled into vtome.
     pub fn is_royalty_free(self) -> bool {
         matches!(
             self,
@@ -169,12 +173,23 @@ impl Encoding {
         )
     }
 
-    /// Whether vtome can be asked to *produce* this. AV1, and nothing else.
+    /// Whether vtome reads this at all: H.264 and AV1, and stills.
     ///
-    /// Deliberately narrower than [`is_royalty_free`](Encoding::is_royalty_free):
-    /// VP9 and Theora are free of charge too, and vtome writes one format.
+    /// Everything else is identified so it can be refused by name — "outside
+    /// vtome's scope" is a different answer from "no decoder compiled in".
+    pub fn is_in_scope(self) -> bool {
+        matches!(self, Encoding::H264 | Encoding::Av1 | Encoding::Still)
+    }
+
+    /// Whether vtome can be asked to *produce* this: H.264, through the OS
+    /// encoder and by default, and AV1, through the bundled `rav1e`.
+    ///
+    /// Narrower than [`is_royalty_free`](Encoding::is_royalty_free) on one side
+    /// — VP9 and Theora are free of charge too, and out of scope — and wider on
+    /// the other, because H.264 is written by the operating system's licensed
+    /// encoder rather than by anything here.
     pub fn is_encodable(self) -> bool {
-        self == Encoding::Av1
+        matches!(self, Encoding::H264 | Encoding::Av1)
     }
 
     /// The four-character code this encoding appears as in an MP4 sample entry.
@@ -509,19 +524,23 @@ mod tests {
         assert_eq!(Encoding::from_codec_id("nonsense"), None);
     }
 
-    /// The crate's reason for existing, as an assertion rather than a comment.
+    /// The crate's reason for existing, as an assertion rather than a comment:
+    /// two formats written, one of them only because the OS licenses it.
     #[test]
-    fn only_royalty_free_encodings_are_encodable() {
-        for encoding in [Encoding::H264, Encoding::H265, Encoding::ProRes] {
-            assert!(!encoding.is_royalty_free(), "{encoding}");
+    fn vtome_writes_h264_and_av1_and_nothing_else() {
+        assert!(Encoding::Av1.is_royalty_free() && Encoding::Av1.is_encodable());
+
+        // Patent-pooled and written anyway — by the operating system's encoder,
+        // whose vendor holds the licence. See `encode`.
+        assert!(!Encoding::H264.is_royalty_free() && Encoding::H264.is_encodable());
+
+        for encoding in [Encoding::H265, Encoding::ProRes, Encoding::Vp9, Encoding::Theora] {
             assert!(!encoding.is_encodable(), "{encoding} must never be written");
         }
 
-        assert!(Encoding::Av1.is_royalty_free() && Encoding::Av1.is_encodable());
-
-        // Free of charge, and still not something vtome writes: one output
-        // format, and it is AV1.
-        assert!(Encoding::Vp9.is_royalty_free());
-        assert!(!Encoding::Vp9.is_encodable());
+        // Free of charge, and still out of scope both ways.
+        assert!(Encoding::Vp9.is_royalty_free() && !Encoding::Vp9.is_in_scope());
+        assert!(Encoding::H264.is_in_scope() && Encoding::Av1.is_in_scope());
+        assert!(!Encoding::H265.is_in_scope());
     }
 }

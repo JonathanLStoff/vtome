@@ -14,6 +14,7 @@
 use std::collections::HashMap;
 use std::path::Path;
 
+use crate::clock::{Monotonic, SharedClock};
 use crate::error::{Error, Result};
 use crate::frame::Frame;
 use crate::output::Output;
@@ -36,6 +37,8 @@ use crate::render::{Gpu, Layer, Picture, Renderer};
 pub struct Compositor {
     sources: HashMap<String, Source>,
     outputs: Vec<Output>,
+    /// The one timeline every film follows — see [`crate::clock`].
+    timeline: SharedClock,
     /// What each output has on the GPU, index for index with `outputs`.
     #[cfg(feature = "render")]
     gpu: Vec<OutputGpu>,
@@ -69,14 +72,27 @@ pub struct Finished {
 }
 
 impl Compositor {
-    /// A compositor with no sources and no outputs.
+    /// A compositor with no sources and no outputs, on a monotonic timeline
+    /// of its own.
     pub fn new() -> Self {
+        Compositor::with_clock(Monotonic::shared())
+    }
+
+    /// A compositor whose films all follow `timeline` — atome's output clock,
+    /// so video stays on the sound.
+    pub fn with_clock(timeline: SharedClock) -> Self {
         Compositor {
             sources: HashMap::new(),
             outputs: Vec::new(),
+            timeline,
             #[cfg(feature = "render")]
             gpu: Vec::new(),
         }
+    }
+
+    /// The timeline films follow.
+    pub fn clock(&self) -> &SharedClock {
+        &self.timeline
     }
 
     /// Opens a film and adds it, playing once, under its
@@ -86,7 +102,7 @@ impl Compositor {
     ///
     /// Whatever [`VideoSource::from_file`] refuses.
     pub fn add_source_from_file<P: AsRef<Path>>(&mut self, path: P) -> Result<String> {
-        let source = VideoSource::from_file(path, None)?;
+        let source = VideoSource::from_file(path)?;
 
         Ok(self.add_source(source))
     }
@@ -104,14 +120,45 @@ impl Compositor {
     /// Adds a film under an id of the caller's choosing, replacing whatever
     /// had that id. It ends when the file does, unless `looping`.
     pub fn insert_video(&mut self, id: impl Into<String>, source: VideoSource, looping: bool) {
+        self.insert_video_at(id, source, looping, None);
+    }
+
+    /// [`insert_video`](Compositor::insert_video), with the film's first frame
+    /// due when the timeline reaches `start_at` — nothing is shown before then.
+    /// `None` starts it once its first picture is on screen.
+    pub fn insert_video_at(
+        &mut self,
+        id: impl Into<String>,
+        source: VideoSource,
+        looping: bool,
+        start_at: Option<std::time::Duration>,
+    ) {
+        let playback = Playback::new(source, looping, self.timeline.clone(), start_at);
+
         self.sources.insert(
             id.into(),
             Source {
-                kind: Kind::Video(Box::new(Playback::new(source, looping))),
+                kind: Kind::Video(Box::new(playback)),
                 showing: None,
                 generation: 0,
             },
         );
+    }
+
+    /// The picture a source is showing now: a film's current frame, a still's
+    /// only one. `None` for a film whose first frame is not due yet, or a
+    /// source that does not exist.
+    pub fn showing(&self, id: &str) -> Option<&Frame> {
+        self.sources.get(id)?.showing.as_ref()
+    }
+
+    /// How far into itself a film is, on its own clock. `None` for a still or
+    /// a missing source.
+    pub fn position(&self, id: &str) -> Option<std::time::Duration> {
+        match &self.sources.get(id)?.kind {
+            Kind::Video(playback) => Some(playback.position()),
+            Kind::Still { .. } => None,
+        }
     }
 
     /// Adds a still under an id of the caller's choosing, replacing whatever

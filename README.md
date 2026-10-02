@@ -25,7 +25,7 @@ A film goes up the same way, as an overlay — no window frame, transparent arou
 the picture, above everything else, and optionally letting the mouse through:
 
 ```rust
-let source = vtome::VideoSource::from_file("clip.mp4", None)?;
+let source = vtome::VideoSource::from_file("clip.mp4")?;
 let placement = Placement::new(MonitorSelector::Primary)
     .area(vtome::geometry::Rect::new(40.0, 40.0, 640.0, 360.0))
     .always_on_top(true);

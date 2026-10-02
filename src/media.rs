@@ -168,19 +168,10 @@ impl TrackInfo {
         }
     }
 
-    /// Whether this crate could decode it, ignoring what is compiled in.
+    /// Whether this crate could decode it, ignoring what is compiled in: H.264,
+    /// AV1, or a still. See [`Encoding::is_in_scope`].
     pub fn is_decodable(&self) -> bool {
-        matches!(
-            self.encoding,
-            Some(
-                Encoding::H264
-                    | Encoding::H265
-                    | Encoding::Av1
-                    | Encoding::Vp9
-                    | Encoding::Vp8
-                    | Encoding::Still
-            )
-        )
+        self.encoding.is_some_and(Encoding::is_in_scope)
     }
 }
 

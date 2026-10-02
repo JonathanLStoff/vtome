@@ -10,12 +10,13 @@ use std::io::BufReader;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use crate::color::ColorSpace;
+use crate::bitstream::{AvcConfig, SequenceParameterSet};
+use crate::color::{ColorSpace, Matrix, Primaries, Range, Transfer};
 use crate::error::{Error, Result};
 use crate::identify::Container;
 use crate::media::{MediaInfo, Packet, Rational, Rotation, TrackInfo, TrackKind};
 
-use super::{demux_error, scaled, video_track};
+use super::{color_from, demux_error, scaled, video_track};
 
 /// Where one track has got to.
 struct Cursor {
@@ -108,17 +109,20 @@ impl Mp4Demuxer {
             // close enough to integer that rounding is safe.
             let frame_rate = rational_from(track.frame_rate());
 
+            let extra_data = parameter_sets(track);
+            let (color, bit_depth) = stated_color(&extra_data, width, height);
+
             tracks.push(video_track(
                 id,
                 codec_id,
                 width,
                 height,
                 frame_rate,
-                8,
-                ColorSpace::guess_for(width, height),
+                bit_depth,
+                color,
                 Rotation::None,
                 duration,
-                parameter_sets(track),
+                extra_data,
             ));
         }
 
@@ -163,26 +167,43 @@ fn parameter_sets(track: &::mp4::Mp4Track) -> Vec<u8> {
         return Vec::new();
     };
 
-    if sps.len() < 4 {
-        return Vec::new();
+    AvcConfig::new(sps.to_vec(), pps.to_vec()).to_record()
+}
+
+/// The colour and bit depth the SPS states, over the guess by resolution.
+///
+/// MP4 says nothing about colour unless it carries a `colr` box, which most
+/// files do not; the encoder wrote it into the SPS instead. Without this a
+/// 640×360 proxy of a BT.709 film is guessed BT.601 and drawn with the wrong
+/// matrix.
+fn stated_color(extra_data: &[u8], width: u32, height: u32) -> (ColorSpace, u32) {
+    let guess = ColorSpace::guess_for(width, height);
+
+    let Some(sps) = AvcConfig::parse(extra_data)
+        .ok()
+        .and_then(|avc| avc.sequence_parameter_sets.into_iter().next())
+        .and_then(|sps| SequenceParameterSet::parse(&sps).ok())
+    else {
+        return (guess, 8);
+    };
+
+    let mut color = color_from(
+        sps.matrix.and_then(Matrix::from_h273),
+        sps.full_range
+            .map(|full| if full { Range::Full } else { Range::Limited }),
+        width,
+        height,
+    );
+
+    if let Some(primaries) = sps.primaries.and_then(Primaries::from_h273) {
+        color.primaries = primaries;
     }
 
-    let mut record = vec![
-        1,        // configuration version
-        sps[1],   // profile
-        sps[2],   // compatibility
-        sps[3],   // level
-        0xFF,     // reserved ones + four-byte NAL lengths
-        0xE0 | 1, // reserved ones + one SPS
-    ];
+    if let Some(transfer) = sps.transfer.and_then(Transfer::from_h273) {
+        color.transfer = transfer;
+    }
 
-    record.extend_from_slice(&(sps.len() as u16).to_be_bytes());
-    record.extend_from_slice(sps);
-    record.push(1);
-    record.extend_from_slice(&(pps.len() as u16).to_be_bytes());
-    record.extend_from_slice(pps);
-
-    record
+    (color, sps.bit_depth)
 }
 
 /// Recovers an exact ratio from a decimal frame rate.

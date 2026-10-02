@@ -14,6 +14,7 @@ use std::sync::mpsc::{Receiver, Sender};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
+use crate::clock::{Monotonic, SharedClock};
 use crate::color::parse_hex_color;
 use crate::compositor::Compositor;
 use crate::error::{Error, Result};
@@ -23,13 +24,76 @@ use crate::output::Output;
 use crate::output_layer::OutputLayer;
 use crate::placement::Monitor;
 use crate::render::{Gpu, Renderer};
-use crate::video_source::VideoSource;
+use crate::video_source::{FrameCache, VideoSource};
 
 /// What `start` takes for each monitor: `(width, height, x, y)` in physical
 /// pixels, `x` and `y` being the output's top-left corner *relative to that
 /// monitor's own top-left*. `(1920, 1080, 0, 0)` is the whole of a 1080p
 /// monitor, wherever it sits in the desktop.
 pub type OutputRect = (i64, i64, i64, i64);
+
+/// Where the engine's time comes from: whether video follows sound.
+///
+/// Every clip runs against one timeline (see [`crate::clock`]). With audio,
+/// that timeline is the audio engine's output clock — what the speakers are
+/// playing, latency included — so pictures stay on the sound and never the
+/// other way round. Without, it is a monotonic clock of vtome's own.
+///
+/// ```no_run
+/// # #[cfg(feature = "atome")]
+/// # fn demo(output: &atome::output::OutputClass<f32>) {
+/// use vtome::Audio;
+///
+/// let audio = Audio::atome(output.clock());
+/// # let _ = audio;
+/// # }
+/// ```
+///
+/// vtome never opens an audio device itself; the application owns atome and
+/// hands over its clock.
+#[derive(Clone, Default)]
+pub enum Audio {
+    /// No audio to follow: a monotonic clock of vtome's own.
+    #[default]
+    Off,
+    /// Follow this master — atome's output clock through
+    /// [`Audio::atome`], or anything else that implements [`MasterClock`].
+    Follow(SharedClock),
+}
+
+impl Audio {
+    /// Follow an atome output: `Audio::atome(output.clock())`.
+    #[cfg(feature = "atome")]
+    pub fn atome(clock: atome::PlayClock) -> Self {
+        Audio::Follow(Arc::new(clock))
+    }
+
+    /// Whether video follows an audio clock.
+    pub fn is_enabled(&self) -> bool {
+        matches!(self, Audio::Follow(_))
+    }
+
+    /// The timeline every clip will run against.
+    pub(crate) fn timeline(&self) -> SharedClock {
+        match self {
+            Audio::Off => Monotonic::shared(),
+            Audio::Follow(clock) => Arc::clone(clock),
+        }
+    }
+}
+
+impl std::fmt::Debug for Audio {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Audio::Off => formatter.write_str("Audio::Off"),
+            Audio::Follow(clock) => formatter
+                .debug_struct("Audio::Follow")
+                .field("position", &clock.position())
+                .field("running", &clock.is_running())
+                .finish(),
+        }
+    }
+}
 
 /// A clip's handle: what [`Controls::stop`] takes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -97,6 +161,7 @@ pub struct Clip {
     z_index: i32,
     hold: Hold,
     looping: bool,
+    start_at: Option<Duration>,
 }
 
 #[derive(Clone, Debug)]
@@ -117,6 +182,7 @@ impl Clip {
             z_index: 0,
             hold: Hold::Forever,
             looping: false,
+            start_at: None,
         }
     }
 
@@ -182,6 +248,20 @@ impl Clip {
         self.looping = looping;
         self
     }
+
+    /// Puts a video's first frame on screen exactly when the engine's
+    /// timeline reaches `position`, and nothing before then. By default a
+    /// video starts as soon as its first picture is up.
+    ///
+    /// With [`Audio::atome`] the timeline is atome's output clock, whose
+    /// position is the mixer's index over channels over sample rate — so a
+    /// sound scheduled at interleaved index `i` and a clip started at
+    /// `i / channels / rate` seconds begin on the same frame. Read where the
+    /// timeline is now with [`Controls::position`]. Stills ignore this.
+    pub fn start_at(mut self, position: Duration) -> Self {
+        self.start_at = Some(position);
+        self
+    }
 }
 
 /// A clip that finished on its own: it ended, ran out its frames, or failed.
@@ -202,6 +282,7 @@ pub(crate) struct Prepared {
     opacity: f32,
     z_index: i32,
     looping: bool,
+    start_at: Option<Duration>,
 }
 
 enum Content {
@@ -213,6 +294,7 @@ pub(crate) enum Command {
     Add(ClipId, Box<Prepared>),
     Stop(ClipId),
     Snapshot(String, Sender<Result<Frame>>),
+    SnapshotClip(ClipId, Sender<Result<Frame>>),
     Close,
 }
 
@@ -225,10 +307,15 @@ pub(crate) struct Shared {
     /// Monitors `start` was given but could not use, and why.
     skipped: Mutex<Vec<(String, String)>>,
     active: Mutex<HashSet<ClipId>>,
+    /// Clips that ended, failed, or were stopped. A clip id is never reused,
+    /// so this only grows — by eight bytes a clip.
+    finished: Mutex<HashSet<ClipId>>,
     ended: Mutex<Vec<ClipEnded>>,
     closed: AtomicBool,
     /// Refreshes the engine has run.
     frames: AtomicU64,
+    /// The timeline every clip runs against, once started.
+    timeline: Mutex<Option<SharedClock>>,
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
@@ -265,6 +352,64 @@ impl Controls {
     /// that monitor; whatever opening the video or image refuses; and
     /// [`Error::Unsupported`] once the engine has closed.
     pub fn add(&self, clip: Clip) -> Result<ClipId> {
+        self.add_with(clip, None)
+    }
+
+    /// Puts any file vtome reads on a monitor's whole output, deciding from
+    /// its *content* what it is: a still is shown until stopped, a video plays
+    /// once. [`add`](Controls::add) with a [`Clip`] says which, and how.
+    ///
+    /// # Errors
+    ///
+    /// As [`add`](Controls::add), and whatever identifying the file refuses.
+    #[cfg(feature = "demux")]
+    pub fn add_generic(
+        &self,
+        path: impl Into<PathBuf>,
+        monitor: impl Into<String>,
+    ) -> Result<ClipId> {
+        let path = path.into();
+        let container = crate::identify::identify_path(&path)?;
+
+        let clip = if container.is_image() {
+            Clip::image(path, monitor)
+        } else {
+            Clip::video(path, monitor)
+        };
+
+        self.add(clip)
+    }
+
+    /// [`add`](Controls::add) for a video with ranges of it already decoded:
+    /// those frames are served from memory and the decoder runs only outside
+    /// them — an instant start, a loop that never waits on a keyframe.
+    ///
+    /// `ranges` are frame numbers, start included and end not, counted from
+    /// the first frame at the file's frame rate; `frames` are those ranges'
+    /// frames end to end, as [`cache_frames`](crate::cache_frames) makes them.
+    ///
+    /// # Errors
+    ///
+    /// As [`add`](Controls::add); [`Error::Unsupported`] for a clip that is
+    /// not a video, a file with no frame rate, or ranges and frames that do
+    /// not add up.
+    pub fn add_cached(
+        &self,
+        clip: Clip,
+        ranges: Vec<(u64, u64)>,
+        frames: Vec<Frame>,
+    ) -> Result<ClipId> {
+        if !matches!(clip.media, Media::Video(_)) {
+            return Err(Error::unsupported(
+                "only a video has frames to cache; this clip is a still",
+            ));
+        }
+
+        let cache = FrameCache::new(ranges, frames)?;
+        self.add_with(clip, Some(cache))
+    }
+
+    fn add_with(&self, clip: Clip, cache: Option<FrameCache>) -> Result<ClipId> {
         if self.shared.closed.load(Ordering::Acquire) {
             return Err(Error::unsupported("the engine has closed"));
         }
@@ -279,7 +424,15 @@ impl Controls {
         }
 
         let content = match clip.media {
-            Media::Video(path) => Content::Video(VideoSource::from_file(path, None)?),
+            Media::Video(path) => {
+                let mut source = VideoSource::from_file(path)?;
+
+                if let Some(cache) = cache {
+                    source.set_cache(cache)?;
+                }
+
+                Content::Video(source)
+            }
             Media::Image(path) => Content::Still {
                 frames: self.frames_for(clip.hold)?,
                 frame: crate::still::load_image(path)?,
@@ -301,6 +454,7 @@ impl Controls {
             opacity: clip.opacity,
             z_index: clip.z_index,
             looping: clip.looping,
+            start_at: clip.start_at,
         };
 
         self.commands
@@ -346,12 +500,29 @@ impl Controls {
             return false;
         }
 
+        lock(&self.shared.finished).insert(id);
         self.commands.send(Command::Stop(id)).is_ok()
     }
 
-    /// Whether a clip is still on screen, or about to be.
-    pub fn is_active(&self, id: ClipId) -> bool {
+    /// Whether a clip is on screen, or about to be: added, and not yet ended,
+    /// failed, or stopped.
+    pub fn is_running(&self, id: ClipId) -> bool {
         lock(&self.shared.active).contains(&id)
+    }
+
+    /// Whether a clip is over: it ended, failed, or was stopped. `false` for
+    /// one still running, and for an id this engine never handed out — the
+    /// two questions are not each other's opposite.
+    pub fn is_finished(&self, id: ClipId) -> bool {
+        lock(&self.shared.finished).contains(&id)
+    }
+
+    /// Where the engine's timeline is now — atome's output clock with
+    /// [`Audio::atome`] — for [`Clip::start_at`]. Zero until started.
+    pub fn position(&self) -> Duration {
+        lock(&self.shared.timeline)
+            .as_ref()
+            .map_or(Duration::ZERO, |timeline| timeline.position())
     }
 
     /// Clips that finished on their own since the last call, oldest first.
@@ -376,7 +547,19 @@ impl Controls {
         lock(&self.shared.skipped).clone()
     }
 
-    /// What `monitor`'s output shows right now, as an RGBA frame —
+    /// The picture a clip is showing right now: a video's current frame, as
+    /// decoded (usually NV12, with its colour space), or a still's.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Unsupported`] for a clip that is not running, or a video whose
+    /// first frame is not up yet; [`Error::Render`] if the engine is not
+    /// running or does not answer within a second.
+    pub fn snapshot(&self, id: ClipId) -> Result<Frame> {
+        self.ask(|reply| Command::SnapshotClip(id, reply))
+    }
+
+    /// What `monitor`'s whole output shows right now, as an RGBA frame —
     /// premultiplied, as it was composited. For a preview in a control
     /// application, a thumbnail, or a test.
     ///
@@ -386,11 +569,17 @@ impl Controls {
     ///
     /// [`Error::NoSuchMonitor`] if no output runs there; [`Error::Render`] if
     /// the engine is not running or does not answer within a second.
-    pub fn snapshot(&self, monitor: &str) -> Result<Frame> {
+    pub fn snapshot_output(&self, monitor: &str) -> Result<Frame> {
+        let monitor = monitor.to_string();
+        self.ask(|reply| Command::Snapshot(monitor, reply))
+    }
+
+    /// Sends a command that answers, and waits a second for the answer.
+    fn ask(&self, command: impl FnOnce(Sender<Result<Frame>>) -> Command) -> Result<Frame> {
         let (reply, answer) = std::sync::mpsc::channel();
 
         self.commands
-            .send(Command::Snapshot(monitor.to_string(), reply))
+            .send(command(reply))
             .map_err(|_| Error::unsupported("the engine has closed"))?;
 
         answer
@@ -622,8 +811,12 @@ impl<W> Core<W> {
         mut screens: Vec<Screen<W>>,
         commands: Receiver<Command>,
         shared: Arc<Shared>,
+        audio: &Audio,
     ) -> Result<Self> {
-        let mut compositor = Compositor::new();
+        let timeline = audio.timeline();
+        *lock(&shared.timeline) = Some(Arc::clone(&timeline));
+
+        let mut compositor = Compositor::with_clock(timeline);
         let mut renderers = HashMap::new();
 
         for screen in &mut screens {
@@ -671,6 +864,9 @@ impl<W> Core<W> {
                 }
                 Command::Snapshot(monitor, reply) => {
                     let _ = reply.send(self.snapshot(&monitor));
+                }
+                Command::SnapshotClip(id, reply) => {
+                    let _ = reply.send(self.snapshot_clip(id));
                 }
                 Command::Close => return Ok(false),
             }
@@ -748,7 +944,10 @@ impl<W> Core<W> {
         let key = id.key();
 
         match prepared.content {
-            Content::Video(source) => self.compositor.insert_video(&key, source, prepared.looping),
+            Content::Video(source) => {
+                self.compositor
+                    .insert_video_at(&key, source, prepared.looping, prepared.start_at);
+            }
             Content::Still { frame, frames } => self.compositor.insert_still(&key, frame, frames),
         }
 
@@ -795,8 +994,21 @@ impl<W> Core<W> {
         )
     }
 
+    /// One clip's current picture.
+    fn snapshot_clip(&self, id: ClipId) -> Result<Frame> {
+        self.compositor
+            .showing(&id.key())
+            .cloned()
+            .ok_or_else(|| {
+                Error::unsupported(format!(
+                    "{id} has no picture up: it is not running, or its first frame is not due yet"
+                ))
+            })
+    }
+
     fn finish(&self, id: ClipId, error: Option<String>) {
         lock(&self.shared.active).remove(&id);
+        lock(&self.shared.finished).insert(id);
         lock(&self.shared.ended).push(ClipEnded { id, error });
     }
 
@@ -943,7 +1155,7 @@ mod tests {
             (Hold::Forever, None),
         ] {
             let id = controls.add_frame(two_by_two(), "any", hold).unwrap();
-            assert!(controls.is_active(id));
+            assert!(controls.is_running(id));
 
             let Ok(Command::Add(sent, prepared)) = receiver.try_recv() else {
                 panic!("{hold:?} never reached the engine");
@@ -993,10 +1205,64 @@ mod tests {
 
         let id = controls.add(Clip::frame(frame, "any")).unwrap();
 
-        assert!(controls.is_active(id));
+        assert!(controls.is_running(id));
+        assert!(!controls.is_finished(id));
         assert!(controls.stop(id));
         assert!(!controls.stop(id), "already stopped");
         assert!(!controls.stop(ClipId(999)), "never existed");
+
+        assert!(!controls.is_running(id) && controls.is_finished(id));
+        // Never handed out: neither running nor finished.
+        assert!(!controls.is_running(ClipId(999)) && !controls.is_finished(ClipId(999)));
+    }
+
+    /// Only a video has frames to cache, and a cache that does not add up is
+    /// refused at the call — before a file is opened or a clip id spent.
+    #[test]
+    fn a_cache_is_checked_before_anything_is_queued() {
+        let (controls, receiver, _shared) = channel(30.0);
+
+        let still = controls.add_cached(Clip::frame(two_by_two(), "any"), vec![(0, 1)], vec![two_by_two()]);
+        assert!(matches!(still, Err(Error::Unsupported { .. })));
+
+        let short = controls.add_cached(Clip::video("/no/such/film.mp4", "any"), vec![(0, 3)], vec![two_by_two()]);
+        assert!(matches!(short, Err(Error::Unsupported { .. })), "three frames promised, one given");
+
+        assert!(receiver.try_recv().is_err());
+    }
+
+    /// `add_generic` decides by content: a PNG is a still, however it is named.
+    #[test]
+    fn a_generic_file_is_shown_as_what_it_is() {
+        let directory = tempfile::TempDir::new().unwrap();
+        let path = directory.path().join("not-a-video.mp4");
+        image::save_buffer(&path, &[255; 16], 2, 2, image::ExtendedColorType::Rgba8).unwrap();
+        // `save_buffer` chose PNG from nothing but the name's lack of one —
+        // write it explicitly as PNG bytes under an MP4 name.
+        let png = directory.path().join("x.png");
+        image::save_buffer(&png, &[255; 16], 2, 2, image::ExtendedColorType::Rgba8).unwrap();
+        std::fs::copy(&png, &path).unwrap();
+
+        let (controls, receiver, _shared) = channel(30.0);
+        let id = controls.add_generic(&path, "any").unwrap();
+
+        let Ok(Command::Add(sent, prepared)) = receiver.try_recv() else {
+            panic!("the file never reached the engine");
+        };
+        assert_eq!(sent, id);
+        assert!(matches!(prepared.content, Content::Still { frames: None, .. }), "until stopped");
+    }
+
+    /// The clock clips follow, before and after a start.
+    #[test]
+    fn the_engine_position_is_zero_until_a_timeline_exists() {
+        let (controls, _receiver, shared) = channel(30.0);
+        assert_eq!(controls.position(), Duration::ZERO);
+
+        *lock(&shared.timeline) = Some(Audio::Off.timeline());
+        std::thread::sleep(Duration::from_millis(5));
+        assert!(controls.position() >= Duration::from_millis(5));
+        assert!(!Audio::Off.is_enabled());
     }
 
     #[test]

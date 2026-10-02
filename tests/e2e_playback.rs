@@ -4,8 +4,8 @@
 //! Demuxer → Decoder → Compositor → Renderer
 //!
 //! Tests are marked `#[ignore]` by default since they require:
-//! 1. Real H.264/HEVC/VP9 test video files
-//! 2. Working FFI decoders (VideoToolbox, dav1d, libvpx)
+//! 1. Real H.264 or AV1 test video files
+//! 2. Working decoders (VideoToolbox, dav1d)
 //!
 //! Once decoders are implemented, run with:
 //! cargo test --test e2e_playback -- --nocapture --ignored
@@ -97,7 +97,7 @@ mod tests {
             extra_data: video.extra_data.clone(),
         };
 
-        let mut decoder = match vtome::decode::open(&config) {
+        let decoder = match vtome::decode::open(&config) {
             Ok(d) => d,
             Err(e) => {
                 eprintln!("No H.264 decoder available: {}", e);

@@ -79,6 +79,82 @@ impl Matrix {
     }
 }
 
+/// The code points ITU-T H.273 gives each of these — the numbers an H.264
+/// SPS, an AV1 sequence header, an MP4 `colr` box, and a Matroska `Colour`
+/// element all write. One table, so every codec and container that states
+/// colour states the same thing.
+impl Primaries {
+    /// From H.273's `colour_primaries`. `None` for one this crate does not
+    /// name, which leaves it to the guess rather than to a wrong answer.
+    pub fn from_h273(code: u8) -> Option<Self> {
+        Some(match code {
+            1 => Primaries::Bt709,
+            5 => Primaries::Bt601_625,
+            6 | 7 => Primaries::Bt601_525,
+            9 => Primaries::Bt2020,
+            _ => return None,
+        })
+    }
+
+    /// As H.273's `colour_primaries`.
+    pub fn h273(self) -> u8 {
+        match self {
+            Primaries::Bt709 => 1,
+            Primaries::Bt601_625 => 5,
+            Primaries::Bt601_525 => 6,
+            Primaries::Bt2020 => 9,
+        }
+    }
+}
+
+impl Transfer {
+    /// From H.273's `transfer_characteristics`. BT.601 and BT.2020's SDR
+    /// curves are BT.709's, and are read as it.
+    pub fn from_h273(code: u8) -> Option<Self> {
+        Some(match code {
+            1 | 6 | 14 | 15 => Transfer::Bt709,
+            13 => Transfer::Srgb,
+            16 => Transfer::Pq,
+            18 => Transfer::Hlg,
+            _ => return None,
+        })
+    }
+
+    /// As H.273's `transfer_characteristics`.
+    pub fn h273(self) -> u8 {
+        match self {
+            Transfer::Bt709 => 1,
+            Transfer::Srgb => 13,
+            Transfer::Pq => 16,
+            Transfer::Hlg => 18,
+        }
+    }
+}
+
+impl Matrix {
+    /// From H.273's `matrix_coefficients`. 470BG and SMPTE 170M are the two
+    /// spellings of BT.601.
+    pub fn from_h273(code: u8) -> Option<Self> {
+        Some(match code {
+            0 => Matrix::Identity,
+            1 => Matrix::Bt709,
+            5 | 6 => Matrix::Bt601,
+            9 => Matrix::Bt2020Ncl,
+            _ => return None,
+        })
+    }
+
+    /// As H.273's `matrix_coefficients`; BT.601 as SMPTE 170M.
+    pub fn h273(self) -> u8 {
+        match self {
+            Matrix::Identity => 0,
+            Matrix::Bt709 => 1,
+            Matrix::Bt601 => 6,
+            Matrix::Bt2020Ncl => 9,
+        }
+    }
+}
+
 /// Whether the samples use the whole numeric range or the broadcast subset.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub enum Range {

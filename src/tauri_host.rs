@@ -17,7 +17,7 @@ use std::time::{Duration, Instant};
 use tauri::{AppHandle, PhysicalPosition, PhysicalSize, Runtime};
 
 use crate::engine::{
-    self, Clip, ClipId, Command, Controls, Core, Hold, OutputRect, Planned, Screen, Shared,
+    self, Audio, Clip, ClipId, Command, Controls, Core, Hold, OutputRect, Planned, Screen, Shared,
 };
 use crate::error::{Error, Result};
 use crate::geometry::Rect;
@@ -35,10 +35,12 @@ use crate::render::Gpu;
 ///     let mut vtome = TauriVtome::new(app.handle().clone(), ["monitor_e16def3726bc150b"], 30.0);
 ///
 ///     let screen = "monitor_342b0e446031e910".to_string();
-///     vtome.start(
+///     let started = vtome.start(
 ///         HashMap::from([(screen.clone(), (1920, 1080, 0, 0))]),
 ///         HashMap::from([(screen.clone(), "#000000FF".to_string())]),
+///         vtome::Audio::Off, // or Audio::atome(output.clock())
 ///     )?;
+///     println!("{} monitors attached", started.monitors.len());
 ///
 ///     let id = vtome.add(Clip::video("intro.mp4", &screen))?;
 ///     app.manage(vtome); // keep it — dropping it closes the outputs
@@ -64,6 +66,9 @@ pub struct TauriVtome<R: Runtime> {
 /// What [`TauriVtome::start`] opened, and what it could not.
 #[derive(Clone, Debug)]
 pub struct Started {
+    /// Every monitor attached, with the ids `start`, `add`, and the excluded
+    /// list use.
+    pub monitors: Vec<Monitor>,
     /// Monitors with an output running.
     pub running: Vec<String>,
     /// Monitors left out, and why: excluded, not attached, or no area.
@@ -193,9 +198,55 @@ impl<R: Runtime> TauriVtome<R> {
         self.controls.add_frame(frame, monitor, hold)
     }
 
+    /// [`Controls::add_generic`]: any file, on a monitor's whole output.
+    ///
+    /// # Errors
+    ///
+    /// As [`Controls::add_generic`].
+    pub fn add_generic(
+        &self,
+        path: impl Into<std::path::PathBuf>,
+        monitor: impl Into<String>,
+    ) -> Result<ClipId> {
+        self.controls.add_generic(path, monitor)
+    }
+
+    /// [`Controls::add_cached`]: a video with ranges of it served from memory.
+    ///
+    /// # Errors
+    ///
+    /// As [`Controls::add_cached`].
+    pub fn add_cached(
+        &self,
+        clip: Clip,
+        ranges: Vec<(u64, u64)>,
+        frames: Vec<crate::frame::Frame>,
+    ) -> Result<ClipId> {
+        self.controls.add_cached(clip, ranges, frames)
+    }
+
     /// [`Controls::stop`].
     pub fn stop(&self, id: ClipId) -> bool {
         self.controls.stop(id)
+    }
+
+    /// [`Controls::is_running`].
+    pub fn is_running(&self, id: ClipId) -> bool {
+        self.controls.is_running(id)
+    }
+
+    /// [`Controls::is_finished`].
+    pub fn is_finished(&self, id: ClipId) -> bool {
+        self.controls.is_finished(id)
+    }
+
+    /// [`Controls::snapshot`]: the picture a clip is showing now.
+    ///
+    /// # Errors
+    ///
+    /// As [`Controls::snapshot`].
+    pub fn snapshot(&self, id: ClipId) -> Result<crate::frame::Frame> {
+        self.controls.snapshot(id)
     }
 
     /// Opens an output on every monitor in `outputs` that is attached and not
@@ -205,7 +256,12 @@ impl<R: Runtime> TauriVtome<R> {
     ///
     /// `outputs` maps a monitor id to `(width, height, x, y)` in physical
     /// pixels, `x` and `y` relative to that monitor's top-left corner. A
-    /// monitor with no background is transparent.
+    /// monitor with no background is transparent. `audio` is where time comes
+    /// from: [`Audio::Off`] for vtome's own clock, or atome's output clock so
+    /// every clip follows the sound.
+    ///
+    /// Returns every attached monitor, and which got an output and which did
+    /// not.
     ///
     /// # Errors
     ///
@@ -216,6 +272,7 @@ impl<R: Runtime> TauriVtome<R> {
         &mut self,
         outputs: HashMap<String, OutputRect>,
         backgrounds: HashMap<String, String>,
+        audio: Audio,
     ) -> Result<Started> {
         let commands = self
             .commands
@@ -228,7 +285,14 @@ impl<R: Runtime> TauriVtome<R> {
         let plans = engine::plan(&outputs, &backgrounds, &self.excluded, &attached, &self.shared)?;
 
         let (gpu, screens) = self.open(&plans)?;
-        let mut core = Core::new(gpu, &plans, screens, commands, Arc::clone(&self.shared))?;
+        let mut core = Core::new(
+            gpu,
+            &plans,
+            screens,
+            commands,
+            Arc::clone(&self.shared),
+            &audio,
+        )?;
 
         let period = Duration::from_secs_f64(1.0 / self.frame_rate);
         let controls = self.controls.clone();
@@ -254,6 +318,7 @@ impl<R: Runtime> TauriVtome<R> {
         *self.engine.lock().unwrap_or_else(PoisonError::into_inner) = Some(engine);
 
         Ok(Started {
+            monitors: attached,
             running: self.controls.running_monitors(),
             skipped: self.controls.skipped_monitors(),
         })

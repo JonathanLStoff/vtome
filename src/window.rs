@@ -30,7 +30,7 @@
 //! use vtome::geometry::Rect;
 //! use vtome::window::Viewer;
 //!
-//! let source = VideoSource::from_file("clip.mp4", None)?;
+//! let source = VideoSource::from_file("clip.mp4")?;
 //! let placement = Placement::new(MonitorSelector::Primary)
 //!     .area(Rect::new(40.0, 40.0, 640.0, 360.0))
 //!     .always_on_top(true);
@@ -186,7 +186,15 @@ impl Viewer {
     /// so a stall costs a few frames instead of permanent lag.
     #[cfg(feature = "demux")]
     pub fn video(source: VideoSource, placement: Placement) -> Self {
-        Viewer::showing(Content::Video(Box::new(Playback::new(source, true))), placement)
+        Viewer::showing(
+            Content::Video(Box::new(Playback::new(
+                source,
+                true,
+                crate::clock::Monotonic::shared(),
+                None,
+            ))),
+            placement,
+        )
     }
 
     fn showing(content: Content, placement: Placement) -> Self {

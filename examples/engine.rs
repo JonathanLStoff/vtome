@@ -49,7 +49,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     });
 
     // The primary monitor, chosen once the event loop can see it.
-    vtome.start_with(|monitors| {
+    vtome.start_with(vtome::Audio::Off, |monitors| {
         let primary = monitors
             .iter()
             .find(|monitor| monitor.is_primary)
@@ -119,7 +119,7 @@ fn run(controls: &Controls, video: &PathBuf, snapshots: Option<PathBuf>) -> Resu
     at(1.0);
     if let Some(directory) = &snapshots {
         std::fs::create_dir_all(directory)?;
-        let shot = controls.snapshot(&monitor)?;
+        let shot = controls.snapshot_output(&monitor)?;
         let path = directory.join("engine-1s.png");
         image::save_buffer(&path, shot.data(), shot.width(), shot.height(), image::ExtendedColorType::Rgba8)?;
         println!("{:>5.2}s  saved {}", clock.elapsed().as_secs_f64(), path.display());

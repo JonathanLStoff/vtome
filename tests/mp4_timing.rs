@@ -66,3 +66,34 @@ fn in_presentation_order_the_frames_are_evenly_spaced() {
         assert!((pair[1] - pair[0]).abs_diff(frame) < Duration::from_millis(1));
     }
 }
+
+/// The fixture was written with `-colorspace smpte170m -color_range tv`, and
+/// says so in its SPS. An MP4 has no other place for it — no `colr` box — so
+/// reading the SPS is what stops the demuxer guessing by resolution.
+#[test]
+fn colour_comes_from_the_sps_rather_than_the_guess() {
+    use vtome::bitstream::{AvcConfig, SequenceParameterSet};
+    use vtome::color::{Matrix, Primaries, Range};
+
+    let demuxer = vtome::open_media(FIXTURE).unwrap();
+    let track = demuxer.info().video().unwrap();
+
+    let avc = AvcConfig::parse(&track.extra_data).unwrap();
+    let sps = SequenceParameterSet::parse(&avc.sequence_parameter_sets[0]).unwrap();
+
+    assert_eq!((sps.width, sps.height), (128, 96));
+    assert_eq!(sps.profile_idc, 100, "high profile");
+    assert_eq!((sps.bit_depth, sps.chroma_format_idc), (8, 1));
+    assert_eq!(sps.matrix, Some(6), "SMPTE 170M");
+    assert_eq!(sps.full_range, Some(false));
+    // Two B-frames, no pyramid: decode order I P B B, so each B-frame has
+    // exactly one picture — the P — decoded before it and shown after it.
+    assert_eq!(sps.max_num_reorder_frames, Some(1));
+
+    assert_eq!(track.color.matrix, Matrix::Bt601);
+    assert_eq!(track.color.primaries, Primaries::Bt601_525);
+    assert_eq!(track.color.range, Range::Limited);
+
+    // And the record round-trips through the builder the encoder uses.
+    assert_eq!(AvcConfig::parse(&avc.to_record()).unwrap(), avc);
+}
