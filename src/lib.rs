@@ -6,7 +6,7 @@
 //! file.mp4 ──demux──▶ H.264 ──platform decode──▶ ┌─────────┐ ──▶ GPU ──▶ corner-pinned quad
 //!                                                │  Frame  │            on monitor 2
 //! file.webm ─demux──▶ AV1 ──────software────────▶ │ (YUV +  │
-//!                                                │  colour)│ ──▶ AV1 out (transcode)
+//!                                                │  colour)│ ──▶ H.264 (OS) or AV1 out (import)
 //! image.png ──────────────image─────────────────▶└─────────┘
 //! ```
 //!
@@ -18,17 +18,19 @@
 //! perspective-correct — see its documentation for why the obvious
 //! implementation leaves a crease down the diagonal.
 //!
-//! Audio is deliberately absent. `atome` is the audio engine; a player here
-//! slaves its clock to one (see [`clock`]) rather than opening a device.
+//! Audio is deliberately absent. `atome` is the audio engine; every clip here
+//! follows one engine timeline, which with [`Audio::atome`](crate::Audio) *is*
+//! atome's output clock (see [`clock`]) — vtome never opens a device.
 //!
-//! # Royalty-free, which is a design constraint rather than a preference
+//! # Nothing patent-pooled is ever bundled
 //!
-//! vtome *writes* AV1 and VP9, both AOMedia/Google royalty-free. It never
-//! writes H.264 or HEVC. It *reads* them through the decoder the operating
-//! system already ships and already licensed — VideoToolbox, Media Foundation,
-//! MediaCodec, VA-API — which is also the fastest path, since those are the
-//! hardware decoders. [`identify::Encoding::is_royalty_free`] is the same rule
-//! in code.
+//! vtome reads H.264 and AV1, and writes them: H.264 by default, but only
+//! ever through the operating system's own codec — VideoToolbox today — whose
+//! vendor already holds the licence; AV1 through the bundled, royalty-free
+//! `rav1e`, wherever the OS has no H.264 encoder or when asked. HEVC and VP9
+//! are out of scope. [`import`](crate::import()) writes a proxy at the output
+//! path first and the full-quality file through a queue — see
+//! `planning/TODO.md` §14 and §15.
 //!
 //! # Everything heavy is optional
 //!
@@ -43,7 +45,9 @@
 //! | `window` | `render` plus winit, so vtome opens its own windows |
 //! | `embed` | `render` against a surface someone else owns — the Tauri path |
 //! | `decode-*` | One decoder backend each |
-//! | `encode-av1`, `mux`, `transcode` | Writing AV1 into WebM |
+//! | `encode-platform`, `encode-av1`, `mux` | H.264 through the OS into MP4, AV1 through rav1e into WebM |
+//! | `transcode` (= `import`) | [`transcode`] and the [`import`](crate::import()) queue; rav1e always comes with it |
+//! | `atome`, `split-audio` | Video following atome's clock; a film's audio to FLAC on import |
 //!
 //! # A first look
 //!
@@ -86,6 +90,14 @@ pub mod encode_videotoolbox;
 #[cfg(feature = "encode-av1")]
 pub mod encode_av1;
 
+// Windows' own H.264 encoder and decoder.
+#[cfg(all(windows, any(feature = "decode-platform", feature = "encode-platform")))]
+pub mod media_foundation;
+
+// Android's own H.264 encoder and decoder.
+#[cfg(all(target_os = "android", any(feature = "decode-platform", feature = "encode-platform")))]
+pub mod media_codec;
+
 #[cfg(feature = "demux")]
 mod playback;
 
@@ -121,6 +133,10 @@ pub mod render;
 
 #[cfg(feature = "window")]
 pub mod window;
+
+// A clip's soundtrack through atome, on the clock its pictures follow.
+#[cfg(all(feature = "atome", feature = "render", feature = "demux", feature = "image", any(feature = "window", feature = "tauri")))]
+mod audio;
 
 // The engine an application drives: outputs per monitor, clips added and
 // stopped from any thread. Two hosts share it — vtome's own windows, and a

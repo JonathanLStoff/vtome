@@ -60,6 +60,21 @@ rav1e = { version = "0.8", optional = true, default-features = false, features =
 # the requirement to that release before publishing.
 atome = { version = "0.8.2", optional = true, default-features = false }
 
+# --- The operating system's codecs off Apple targets ------------------------
+# Media Foundation on Windows: the H.264 encoder and decoder Windows ships, so
+# — as with VideoToolbox — the licence is the OS vendor's. Android's MediaCodec
+# is plain C in libmediandk and needs no crate. The same version Tauri uses,
+# so an application with both builds one copy.
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.61", optional = true, features = [
+    "Win32_Foundation",
+    "Win32_Media_MediaFoundation",
+    "Win32_System_Com",
+    "Win32_System_Com_StructuredStorage",
+    "Win32_System_Ole",
+    "Win32_System_Variant",
+] }
+
 [features]
 default = ["demux", "image"]
 
@@ -76,14 +91,14 @@ decode-av1 = []
 # through its C API directly, so this pulls in no crates — only system
 # frameworks. It is also the only way vtome reads H.264: the licence is the OS
 # vendor's, never ours.
-decode-platform = []
+decode-platform = ["dep:windows"]
 all-decoders = ["decode-av1", "decode-platform"]
 
 # Encoders. AV1 through the bundled rav1e; H.264 through the operating
 # system's encoder only — VideoToolbox on Apple targets, system frameworks and
 # no crates, for the same licensing reason as decoding.
 encode-av1 = ["dep:rav1e"]
-encode-platform = []
+encode-platform = ["dep:windows"]
 # Containers out: MP4 through the `mp4` crate's writer, WebM through a small
 # Matroska writer of vtome's own.
 mux = ["demux"]
@@ -91,12 +106,13 @@ mux = ["demux"]
 # application that transcodes has AV1 wherever the OS has no H.264 encoder.
 transcode = ["demux", "mux", "decode-platform", "encode-platform", "encode-av1"]
 
-# Video follows atome's output clock: `Audio::atome(output.clock())`.
-atome = ["dep:atome"]
-# `import`'s `output_audio`: a film's soundtrack to FLAC through atome. Its own
-# feature because atome's `import` still decodes AAC with Symphonia's bundled
-# decoder (atome planning §3.3), which vtome must not pull in quietly.
-split-audio = ["transcode", "atome", "atome/import", "atome/export"]
+# Sound through atome: `Audio::atome(&output)` puts video on the output's
+# clock and plays every video clip's soundtrack through it. Decoding the
+# soundtrack is atome's `import` — which, until atome planning §3.3 moves AAC
+# to the OS decoders, decodes AAC with Symphonia's bundled decoder.
+atome = ["dep:atome", "atome/import"]
+# `import`'s `output_audio`: a film's soundtrack to FLAC through atome.
+split-audio = ["transcode", "atome", "atome/export"]
 
 # Presentation.
 render = ["dep:wgpu", "dep:bytemuck", "dep:pollster", "dep:raw-window-handle"]

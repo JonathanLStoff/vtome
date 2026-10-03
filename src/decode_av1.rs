@@ -25,11 +25,19 @@ pub struct Av1Decoder {
 }
 
 impl Av1Decoder {
-    /// Create a new AV1 decoder.
+    /// Refuses, by name, until it decodes: a decoder that opened and then
+    /// produced no pictures would be a black window with no reason given.
+    /// vtome plays H.264 — what `import` writes by default — everywhere.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::NoDecoder`], always, for now (planning/TODO.md §2).
     pub fn new() -> Result<Self> {
-        // Full implementation would initialize dav1d/rav1d decoder here
-        Ok(Av1Decoder {
-            _marker: std::marker::PhantomData,
+        Err(Error::NoDecoder {
+            encoding: Encoding::Av1,
+            remedy: "software AV1 decoding (dav1d/rav1d) is not implemented yet; vtome plays \
+                     H.264 — import the file to get one"
+                .to_string(),
         })
     }
 }

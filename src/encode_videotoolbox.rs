@@ -548,9 +548,11 @@ impl Encoder for VideoToolboxEncoder {
         // The spec's cadence, not the encoder's: every keyframe_frames'th
         // picture is forced to be one, and the interval caps set at open stop
         // any in between.
-        let properties = (self.frames_in % self.keyframe_frames == 0)
-            .then(|| self.force_keyframe.get())
-            .unwrap_or(ptr::null());
+        let properties = if self.frames_in.is_multiple_of(self.keyframe_frames) {
+            self.force_keyframe.get()
+        } else {
+            ptr::null()
+        };
         self.frames_in += 1;
 
         let mut flags = 0_u32;

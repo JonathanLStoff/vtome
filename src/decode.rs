@@ -26,8 +26,8 @@
 //!
 //! # What is implemented
 //!
-//! VideoToolbox, for H.264 — see [`crate::decode_videotoolbox`], built on Apple
-//! targets with `decode-platform`. For everything else [`open`] refuses
+//! H.264 through VideoToolbox (Apple targets), Media Foundation (Windows), and
+//! MediaCodec (Android), each with `decode-platform`. For everything else [`open`] refuses
 //! honestly, naming the backend that would have taken the work, rather than
 //! returning a decoder that produces nothing. See `planning/TODO.md` §2.
 
@@ -326,6 +326,18 @@ fn instantiate(
         #[cfg(all(feature = "decode-platform", target_vendor = "apple"))]
         Backend::VideoToolbox => Some(
             crate::decode_videotoolbox::VideoToolboxDecoder::with_hardware(config, hardware)
+                .map(|decoder| Box::new(decoder) as Box<dyn Decoder>),
+        ),
+
+        #[cfg(all(feature = "decode-platform", windows))]
+        Backend::MediaFoundation => Some(
+            crate::media_foundation::MediaFoundationDecoder::new(config, hardware)
+                .map(|decoder| Box::new(decoder) as Box<dyn Decoder>),
+        ),
+
+        #[cfg(all(feature = "decode-platform", target_os = "android"))]
+        Backend::MediaCodec => Some(
+            crate::media_codec::MediaCodecDecoder::new(config, hardware)
                 .map(|decoder| Box::new(decoder) as Box<dyn Decoder>),
         ),
 

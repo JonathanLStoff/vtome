@@ -130,3 +130,72 @@ as it lands (see `.claude/CLAUDE.md` in the sibling crates for the habit).
   which Tauri does not report. winit and Tauri's tao name a Mac display the same
   way, so both versions gave the built-in display `monitor_309c10e50ce2f28c`.
   Pinned by a test
+- **`import`: H.264 by default, a proxy now, the real file later, through a
+  queue** (planning §14, asked for 2026-10-01). `vtome::import(input, output,
+  output_audio)` checks the input at the call — container, video, a decoder,
+  an encoder — and returns a `JobId`. A proxy (≤ 640 px, fast settings) is
+  written beside the output and renamed onto it, so the path plays at once;
+  the full-quality file encodes in a temp directory and replaces it in one
+  rename (copy-then-rename across volumes). Two bounded lanes — proxies and
+  audio, final encodes — one worker each by default: five files queued never
+  ran more than one encoder per lane. `import_progress()` reports every file:
+  stage, fractions, frames, codec, size, whether the output plays yet,
+  hardware used, error. `cancel` and `wait`. `ImportOptions::hardware` is
+  `Prefer`/`Require`/`Off` and reaches decoder and encoder alike
+- **§15's spec in every H.264 file**: High profile with Level 4.1 *declared*,
+  CABAC, 8-bit 4:2:0, no B-frames, a keyframe forced every 2 s exactly (closed
+  GOPs), quality 0.68, and `moov` before `mdat`. Pictures bigger or faster
+  than 4.1 allows are scaled to fit (4K30 → 1920×1080), `Level::Auto` to opt
+  out. Checked from the files' own SPS and, where installed, by ffprobe
+  (`profile=High level=41 has_b_frames=0`)
+- **Encoders**: H.264 through VideoToolbox only (hardware, or Apple's own
+  software encoder on a Mac when asked) — never a bundled H.264 encoder; AV1
+  through rav1e, now compiled into every `transcode` build. `encode::open`
+  refuses by name, like `decode::open`
+- **Muxers**: MP4 through the `mp4` crate plus a faststart rewrite (offsets
+  shifted, `stco` widened to `co64` past 4 GB); WebM through a small Matroska
+  writer of vtome's own with SeekHead, Duration, a cluster per keyframe, and
+  Cues. Both read back through vtome's demuxers
+- **Colour from the SPS**: the MP4 demuxer reads matrix, range, primaries,
+  transfer, and bit depth from the SPS's VUI instead of guessing by size, and
+  the encoders write them in. `scale` converts NV12/I420 and shrinks by area
+  averaging
+- **One clock for all playback, from atome's cpal stream**: every clip follows
+  one engine timeline through `clock::Follower`; `start(…, Audio)` takes
+  `Audio::Off` or `Audio::atome(output.clock())`. `Clip::start_at` puts a
+  film's first frame at a point on that timeline
+- **The engine's surface as sketched**: `add_generic` (decides still or video
+  by content), `add_cached` with `cache_frames` (cached ranges from memory,
+  decoding only between them), `is_running`, `is_finished`, `snapshot(clip)`
+  (the output is `snapshot_output`), `position`, and `Started::monitors`.
+  `VideoSource` seeks to the exact frame and knows its `origin`
+- **VP9 scaffolding removed**; HEVC and VP9 are refused as out of scope, not
+  as a missing feature
+- **The Docker matrix stays out of `make test`**: its Mac leg now builds into
+  `target/docker-macos`. Sharing `target/` had left test binaries pointing at a
+  deleted temp copy, which made `mp4_timing` fail in the normal suite
+- `make test` now runs `render,decode-platform,window,split-audio`: 272 tests, all passing
+- **No bundled H.264 or AAC codec anywhere** (asked for 2026-10-03). Every
+  H.264 encoder and decoder is the OS's: VideoToolbox, and now **Media
+  Foundation** (Windows: a vendor's hardware MFT or Microsoft's software one,
+  synchronous and asynchronous MFTs behind one `Transform`) and **MediaCodec**
+  (Android: `libmediandk` declared by hand, API-26/28 calls looked up at run
+  time). Both encode to §15 — High 4.1, no B-frames, 2 s closed GOPs, quality
+  rate control — and decode to NV12. Compiled, type-checked, and clippy-clean
+  for `x86_64-pc-windows-msvc` and `aarch64-linux-android`; **not yet run on
+  either system**. AAC goes through atome's new OS decoders. `cargo tree -i`
+  finds no AAC or H.264 codec crate in vtome or atome with every feature on
+- **H.264 is the default everywhere.** `import` no longer falls back to AV1
+  where the OS has no H.264 encoder; it refuses and says AV1 must be asked
+  for. The AV1 decoder stub refuses by name instead of opening and showing
+  nothing
+- **A video's sound plays through atome, automatically.** `Audio::atome(&output)`
+  puts every clip on the output's clock and plays each video clip's
+  soundtrack through it — its own audio track, or `Clip::audio(path)` when it
+  has none — scheduled to start with its first picture, fed at most 750 ms
+  ahead, as one atome voice: stopping the clip takes the sound back within a
+  buffer. Looping films loop their sound
+- `bitstream::AccessUnit` takes an encoder's Annex B output apart into MP4's
+  shape (parameter sets lifted out, length-prefixed slices)
+- README rewritten around what exists: the codec rule, `import`, the engine and
+  its sound, the feature map, and the Docker matrix as opt-in

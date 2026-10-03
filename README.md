@@ -2,7 +2,7 @@
 
 **V**ideo **T**ranslucent **O**ptimized **M**acGyver **E**ngine — put an image or
 a video on a specific monitor, or on a specific *quadrilateral* of one, without
-FFmpeg and without a codec anyone charges for.
+FFmpeg and without bundling a codec anyone charges for.
 
 ```rust
 use vtome::window::Viewer;
@@ -20,19 +20,6 @@ Viewer::new(frame, placement).show()?;
 
 `Placement::corners` takes four arbitrary corners when a symmetric keystone is
 not the shape you need.
-
-A film goes up the same way, as an overlay — no window frame, transparent around
-the picture, above everything else, and optionally letting the mouse through:
-
-```rust
-let source = vtome::VideoSource::from_file("clip.mp4")?;
-let placement = Placement::new(MonitorSelector::Primary)
-    .area(vtome::geometry::Rect::new(40.0, 40.0, 640.0, 360.0))
-    .always_on_top(true);
-
-let report = Viewer::video(source, placement).click_through(true).show()?;
-println!("{} shown, {} dropped", report.presented, report.dropped);
-```
 
 ## The trapezoid is the point
 
@@ -57,64 +44,143 @@ the centre of the picture:
 A quad that folds over itself is `Error::Placement` rather than something drawn
 inside out.
 
-## Royalty-free is a constraint, not a preference
+## H.264 by default, and only ever the operating system's
 
-vtome decodes **H.264** and **AV1**, and writes **AV1** — nothing else. AV1 is
-AOMedia royalty-free, and `rav1e` encodes it in pure Rust. H.264 is never
-written, and it is only ever *read* through the decoder the operating system
-already ships and already licensed: VideoToolbox, Media Foundation, MediaCodec,
-VA-API. That is also the fast path, since those are the hardware decoders.
-`Encoding::is_encodable()` is the same rule in code, and a test asserts it from
-outside the crate so it cannot quietly change.
+vtome plays and writes **H.264** — it hardware-decodes on every machine a file
+is likely to reach — and H.264 is patent-pooled, so vtome never bundles an H.264
+encoder or decoder. Every H.264 frame in or out goes through the codec the
+operating system ships and already licensed:
+
+| Platform | H.264 decode and encode |
+| --- | --- |
+| macOS, iOS | VideoToolbox |
+| Windows | Media Foundation |
+| Android | MediaCodec |
+| Linux | none yet (VA-API is planned) — refused by name, never bundled |
+
+The same rule holds for the audio half: AAC is decoded by
+[`atome`](../atome) through AudioToolbox, Media Foundation, or MediaCodec — never
+Symphonia's AAC decoder or libfdk-aac, neither of which is compiled into either
+crate. `cargo tree -i` finds no AAC or H.264 codec crate in either dependency
+graph with every feature on.
+
+**AV1** is royalty-free, so its encoder, `rav1e`, is bundled with every transcode
+build — but written only when asked for: vtome cannot yet play AV1 back on most
+machines (dav1d is planned), and the AV1 decoder refuses by name rather than
+opening a file and showing nothing. HEVC and VP9 are out of scope both ways.
+
+## Import: a playable file now, the real one later
+
+```rust
+let job = vtome::import("camera/take-3.mov", "show/take-3.mp4", Some("show/take-3.flac"))?;
+
+// Poll from a UI, say every 500 ms:
+for file in vtome::import_progress() {
+    println!("{}: {:?} {:.0}%", file.output.display(), file.stage, file.fraction * 100.0);
+}
+```
+
+`import` checks the file at the call — a container vtome reads, a video track,
+something here to decode it and encode it — and returns at once. A small proxy
+(640 px at most, the encoder's fastest settings) is written to the output path
+first, so the path plays straight away; the full-quality file encodes in a temp
+directory and replaces the proxy in one rename. Jobs go through a queue — one
+lane for proxies and audio, one for final encodes — so a hundred imports never
+mean a hundred encoders. `cancel`, `wait`, and `ImportOptions::hardware`
+(`Prefer`, `Require`, `Off`) are on `vtome::import_queue()`.
+
+Every H.264 file it writes meets one spec, chosen so any hardware decoder takes
+it instantly: High profile with **Level 4.1** declared, 8-bit 4:2:0, no
+B-frames, a keyframe every two seconds exactly (closed GOPs), CABAC, and `moov`
+before `mdat`. A picture bigger or faster than 4.1 allows — 4K, 1080p60 — is
+scaled to fit. The tests check each of those from the files' own bytes, and with
+`ffprobe` where it is installed.
+
+## The engine: outputs per monitor, clips from any thread, sound in step
+
+```rust
+use std::collections::HashMap;
+use vtome::{Audio, Clip, Vtome};
+
+let output = atome::output::OutputClass::<f32>::new(/* … */);
+let mut vtome = Vtome::new(["monitor_e16def3726bc150b"], 30.0);
+let controls = vtome.controls();
+
+std::thread::spawn(move || {
+    // The film's own soundtrack plays through atome, on the same clock as the
+    // pictures. A film without one can be given a file — the FLAC `import`
+    // split out, say.
+    let take = controls.add(Clip::video("show/take-3.mp4", "monitor_342b…").audio("show/take-3.flac"))?;
+    let logo = controls.add_generic("logo.png", "monitor_342b…")?; // still or video, by content
+    controls.stop(logo);
+    assert!(controls.is_finished(logo));
+    let frame = controls.snapshot(take)?;
+    # Ok::<(), vtome::Error>(())
+});
+
+let outputs = HashMap::from([("monitor_342b…".to_string(), (1920, 1080, 0, 0))]);
+vtome.start(outputs, HashMap::new(), Audio::atome(&output))?;
+```
+
+`TauriVtome` is the same engine inside a Tauri application, which owns the event
+loop; its `start` returns the attached monitors. `add_cached` plays ranges of a
+film from frames already decoded (`cache_frames` makes them) and decodes only
+between them. `Clip::start_at` puts a film's first frame at an exact point on the
+engine's clock — atome's output clock, with audio — which is how a picture lines
+up with a sound scheduled there.
+
+Audio leads, always. Every clip follows one timeline, and with `Audio::atome`
+that timeline is what the speakers are playing, latency included. Stopping a
+clip takes its soundtrack back within a buffer. A dropped frame is invisible; a
+stuttered audio buffer is not.
 
 ## What works today
 
 | | |
 | --- | --- |
 | `identify` | Container from magic bytes, never the extension — MP4/MOV, Matroska/WebM, AVIF/HEIF, PNG, JPEG, GIF, WebP, BMP, TIFF |
-| `demux` | MP4 and Matroska/WebM taken apart: tracks, timing, keyframes, colour metadata, parameter sets. Pure Rust |
+| `demux` | MP4 and Matroska/WebM taken apart: tracks, timing, keyframes, colour (from the SPS, not guessed), parameter sets. Pure Rust |
+| `decode` | H.264 through the OS: VideoToolbox, Media Foundation, MediaCodec. Hardware, software, or either |
+| `encode`, `mux`, `transcode`, `import` | H.264 through the OS into faststart MP4; AV1 through rav1e into WebM; the queue above |
+| `scale` | NV12 ↔ I420 and area-averaged shrinking, in pure Rust |
 | `still` | Images in, as frames, down the same pipe as video |
-| `geometry` | Rectangles, convex quads, homographies, and the fit modes |
-| `placement` | Monitor selectors, areas, corner pinning, late resolution with a stated fallback |
-| `decode` | H.264 through VideoToolbox on macOS and iOS: hardware decode, NV12 straight to the shader, B-frames put back in display order |
+| `geometry`, `placement` | Rectangles, convex quads, homographies, fit modes; monitor selectors resolved late with a stated fallback |
 | `render` | wgpu: YUV→RGB and corner pinning in one shader pass, offscreen or onto a surface |
-| `window` | winit: a still or a film as an overlay — undecorated, transparent, optionally on top and click-through — on the monitor you named |
-| `clock` | Playback timing, and slaving video to an external (audio) master |
-| `bitstream` | Annex-B ↔ length-prefixed, and `avcC` parameter sets |
+| `window`, `tauri` | The engine in vtome's own windows, or a Tauri application's |
+| `clock` | One timeline for every clip, following atome's output clock or a monotonic one |
+| `bitstream` | Annex-B ↔ length-prefixed, `avcC` records, SPS parsing |
 
-**Not yet:** H.264 decoders on Windows, Android, and Linux; AV1 decoding (dav1d,
-and VideoToolbox on M3-class hardware); encoding and transcoding. Each is planned
-in `planning/TODO.md` §2 and §4. Where there is no decoder, opening a file says
-which feature or platform would have handled it — deliberately, rather than a
-decoder that returns no frames and a black window.
-
-So today vtome shows **still images** anywhere on your desktop, in any convex
-quadrilateral, and on a Mac **plays H.264** there too.
+Windows and Android are compiled and type-checked on every change; they have
+not yet been run on those systems' hardware.
 
 ## Everything heavy is optional
 
 ```toml
 [dependencies]
-vtome = { version = "0.1", default-features = false, features = ["demux"] }
+vtome = { version = "0.2", default-features = false, features = ["demux"] }
 ```
 
 | Feature | What it adds | Default |
 | --- | --- | --- |
 | `demux` | MP4 + Matroska/WebM parsing | ✓ |
 | `image` | Still images | ✓ |
+| `decode-platform` | The OS's H.264 decoder. System frameworks on Apple and Android; the `windows` crate on Windows | |
+| `encode-platform` | The OS's H.264 encoder, likewise | |
+| `encode-av1` | rav1e, bundled | |
+| `mux` | MP4 and WebM writing | |
+| `transcode` (= `import`) | `transcode` and `import`; brings the three above | |
+| `atome` | Video on atome's clock, and soundtracks through atome | |
+| `split-audio` | `import`'s audio split to FLAC, through atome | |
 | `render` | wgpu. A GPU and a surface — *not* a window | |
 | `window` | `render` + winit: vtome opens its own windows | |
-| `embed` | `render` against a surface someone else owns — the Tauri path | |
-| `decode-platform` | The OS's own decoder — VideoToolbox so far. Links system frameworks; pulls in no crates | |
-| `decode-av1` | AV1 in software, everywhere (not implemented yet) | |
-| `encode-av1`, `mux`, `transcode` | Writing AV1 into WebM | |
-
-A build that decodes frames and hands them to somebody else's renderer compiles
-no windowing library, no GPU abstraction, and no C toolchain.
+| `tauri` | The engine inside a Tauri application | |
+| `embed` | `render` against a surface someone else owns | |
+| `decode-av1` | AV1 in software (refuses until dav1d is wired up) | |
 
 ## Embedding in Tauri, or any host that owns its window
 
-Take `render` (and `embed`) rather than `window`, and give vtome a surface:
+Take `tauri` for the whole engine, or `render` (and `embed`) to draw into a
+surface you own:
 
 ```rust
 let gpu = vtome::render::Gpu::from_instance(instance, Some(&surface))?;
@@ -128,25 +194,10 @@ Do **not** ship decoded frames over the IPC bridge to a canvas: a 4K frame is
 about 12 MB, and 24 fps of them is ~300 MB/s through a JSON channel. Render into
 a native surface composited with the webview instead.
 
-## Audio is somebody else's job
-
-vtome never opens an audio device. Its demuxers report that audio tracks exist
-and hand their packets over untouched; pair it with [`atome`](../atome) and slave
-video to the audio clock:
-
-```rust
-impl vtome::MasterClock for MyAudioEngine {
-    fn position(&self) -> std::time::Duration { self.play_position() }
-}
-```
-
-Audio leads, always. A dropped frame is invisible; a stuttered audio buffer is
-not.
-
 ## Building and testing
 
 ```sh
-make test          # everything, including the GPU tests where there is a GPU
+make test          # the whole suite: GPU, VideoToolbox, transcode, import, audio
 make corner-pin    # the homography, printed
 make monitors      # what is attached
 make show FILE=poster.png MONITOR=1 KEYSTONE=0.15
@@ -154,31 +205,25 @@ make play FILE=clip.mp4 AREA=40,40,640,360 CLICK_THROUGH=1 ONCE=1
 make contact-sheet FILE=clip.mp4   # decode it all, save six frames as a PNG
 ```
 
-### On every operating system
+The decoder's tests play `tests/data/bars_h264.mp4` — 2.7 KB, 24 frames, with
+B-frames — whose moving bar says which frame each picture is, so display order,
+seeking, and frame caches are checked from the pixels rather than trusted from
+timestamps. Files vtome writes are decoded again and checked the same way. The
+renderer's tests draw on a real GPU and read the pixels back. Tests that need a
+GPU, an audio device, or `ffmpeg` (to make a fixture with sound) skip with a
+message where there is none.
+
+### On every operating system — for special occasions
 
 ```sh
 make docker-test                           # every system this host can run
 make docker-test SYSTEMS="debian alpine"   # just these
 ```
 
-Runs from Linux, Windows (`docker\run.ps1`, or `run.sh` from Git Bash), or an
-Apple-silicon Mac. Debian, Ubuntu, Fedora, and Alpine run the tests in
-containers — GPU tests included, on Mesa's software Vulkan — each carrying
-ffmpeg to rebuild the fixtures. Windows is cross-built and tested under Wine;
-Android is cross-built with the NDK. The native systems are skipped wherever
-they cannot run rather than failed: macOS (and the iOS cross-build) runs on a
-Mac, and a real Windows container only on a Windows host.
-
-The decoder's tests play `tests/data/bars_h264.mp4` — 2.7 KB, 24 frames, with
-B-frames — whose moving bar says which frame each picture is, so display order
-is checked from the pixels rather than trusted from timestamps. vtome cannot
-write H.264, so that fixture is committed; `tests/data/make_h264_fixture.sh`
-rebuilds it.
-
-The renderer's tests draw on a real GPU and read the pixels back — a keystoned
-quad has to come out narrower at the top, and the picture's midline has to land
-within three pixels of where the homography says. Where there is no adapter they
-skip with a message rather than failing.
+Not part of `make test`, and never run with it. Debian, Ubuntu, Fedora, and
+Alpine run the tests in containers; Windows is cross-built and tested under
+Wine; Android is cross-built with the NDK; macOS (and the iOS cross-build) runs
+natively on a Mac, into a target directory of its own.
 
 ## License
 

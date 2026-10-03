@@ -2,7 +2,7 @@
 //! a queue, so importing a hundred files never means a hundred encoders.
 //!
 //! ```no_run
-//! // H.264 where the OS can encode it, AV1 where it cannot; the audio split
+//! // H.264, always, unless AV1 is asked for; the audio split
 //! // to FLAC through atome (the `split-audio` feature) when a path is given.
 //! let job = vtome::import("camera/take-3.mov", "show/take-3.mp4", None::<&str>)?;
 //!
@@ -72,8 +72,9 @@ impl std::fmt::Display for JobId {
 /// How to import.
 #[derive(Clone, Debug)]
 pub struct ImportOptions {
-    /// What to write: `None` for H.264 where the OS can encode it, otherwise
-    /// AV1.
+    /// What to write: `None` for H.264, the default; `Some(Encoding::Av1)`
+    /// for the bundled rav1e, which vtome cannot yet play back on most
+    /// machines.
     pub encoding: Option<Encoding>,
     /// Whether decoding and encoding may, must, or must not use hardware —
     /// for the proxy and the final file alike.
@@ -496,8 +497,8 @@ pub fn import_queue() -> &'static ImportQueue {
 }
 
 /// Imports `input` to `output` through [`import_queue`], with the default
-/// [`ImportOptions`]: a proxy at `output` first, then the final file — H.264
-/// where the OS can encode it, AV1 otherwise — and the audio to
+/// [`ImportOptions`]: a proxy at `output` first, then the final file in
+/// H.264 — and the audio to
 /// `output_audio` as FLAC if given. Returns at once.
 ///
 /// # Errors

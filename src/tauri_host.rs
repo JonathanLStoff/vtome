@@ -38,7 +38,7 @@ use crate::render::Gpu;
 ///     let started = vtome.start(
 ///         HashMap::from([(screen.clone(), (1920, 1080, 0, 0))]),
 ///         HashMap::from([(screen.clone(), "#000000FF".to_string())]),
-///         vtome::Audio::Off, // or Audio::atome(output.clock())
+///         vtome::Audio::Off, // or Audio::atome(&output)
 ///     )?;
 ///     println!("{} monitors attached", started.monitors.len());
 ///

@@ -313,6 +313,45 @@ impl AvcConfig {
     }
 }
 
+/// An encoder's Annex B access unit, taken apart for MP4: the parameter sets
+/// it carried in-band, and everything else as four-byte length-prefixed NAL
+/// units. What Media Foundation and MediaCodec hand back, made into what
+/// VideoToolbox already does.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct AccessUnit {
+    /// The SPS, if this unit carried one.
+    pub sps: Option<Vec<u8>>,
+    /// The PPS, if this unit carried one.
+    pub pps: Option<Vec<u8>>,
+    /// The picture's NAL units, length-prefixed; access unit delimiters and
+    /// parameter sets are left out, since MP4 keeps the latter in `avcC`.
+    pub data: Vec<u8>,
+    /// Whether it holds an IDR slice.
+    pub is_keyframe: bool,
+}
+
+impl AccessUnit {
+    /// Takes an Annex B access unit apart.
+    pub fn split(annex_b: &[u8]) -> Self {
+        let mut unit = AccessUnit::default();
+
+        for nal in annex_b_units(annex_b) {
+            match nal[0] & 0x1F {
+                7 => unit.sps = Some(nal.to_vec()),
+                8 => unit.pps = Some(nal.to_vec()),
+                9 => {}
+                kind => {
+                    unit.is_keyframe |= kind == 5;
+                    unit.data.extend_from_slice(&(nal.len() as u32).to_be_bytes());
+                    unit.data.extend_from_slice(nal);
+                }
+            }
+        }
+
+        unit
+    }
+}
+
 /// What an H.264 sequence parameter set says about the pictures under it.
 ///
 /// Read for two reasons. The colour description: an MP4 says nothing about
@@ -687,6 +726,27 @@ mod tests {
         assert_eq!(bits.se().unwrap(), -1);
         assert_eq!(bits.se().unwrap(), 2);
         assert!(bits.u(8).is_err(), "out of bits");
+    }
+
+    /// An encoder's Annex B output, made into MP4's shape: the parameter sets
+    /// lifted out, the delimiter dropped, the slice length-prefixed.
+    #[test]
+    fn an_annex_b_access_unit_is_taken_apart() {
+        let stream = [
+            0, 0, 0, 1, 0x09, 0xF0, // access unit delimiter
+            0, 0, 0, 1, 0x67, 0x64, 0x00, 0x29, // SPS
+            0, 0, 1, 0x68, 0xEE, // PPS, three-byte start code
+            0, 0, 0, 1, 0x65, 0x88, 0x80, // IDR slice
+        ];
+
+        let unit = AccessUnit::split(&stream);
+
+        assert_eq!(unit.sps.as_deref(), Some(&[0x67, 0x64, 0x00, 0x29][..]));
+        assert_eq!(unit.pps.as_deref(), Some(&[0x68, 0xEE][..]));
+        assert_eq!(unit.data, [0, 0, 0, 3, 0x65, 0x88, 0x80]);
+        assert!(unit.is_keyframe);
+
+        assert!(!AccessUnit::split(&[0, 0, 1, 0x41, 0x9A]).is_keyframe, "a P slice");
     }
 
     /// The `03` after two zeros is the encoder's, not the payload's.

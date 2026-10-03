@@ -44,33 +44,39 @@ pub type OutputRect = (i64, i64, i64, i64);
 /// # fn demo(output: &atome::output::OutputClass<f32>) {
 /// use vtome::Audio;
 ///
-/// let audio = Audio::atome(output.clock());
+/// let audio = Audio::atome(output);
 /// # let _ = audio;
 /// # }
 /// ```
 ///
 /// vtome never opens an audio device itself; the application owns atome and
-/// hands over its clock.
+/// hands over a handle to one of its outputs.
 #[derive(Clone, Default)]
 pub enum Audio {
-    /// No audio to follow: a monotonic clock of vtome's own.
+    /// No audio: a monotonic clock of vtome's own, and no soundtracks.
     #[default]
     Off,
-    /// Follow this master — atome's output clock through
-    /// [`Audio::atome`], or anything else that implements [`MasterClock`].
+    /// Follow this master, playing no sound — any [`MasterClock`](crate::MasterClock).
     Follow(SharedClock),
+    /// Follow an atome output's clock *and* play every video clip's
+    /// soundtrack through it, in step with the pictures. Made with
+    /// [`Audio::atome`].
+    #[cfg(feature = "atome")]
+    Atome(atome::output::Scheduler<f32>),
 }
 
 impl Audio {
-    /// Follow an atome output: `Audio::atome(output.clock())`.
+    /// Video on atome's clock, with every video clip's sound played through
+    /// `output`: its own audio track, or the file given with
+    /// [`Clip::audio`] when the film has none.
     #[cfg(feature = "atome")]
-    pub fn atome(clock: atome::PlayClock) -> Self {
-        Audio::Follow(Arc::new(clock))
+    pub fn atome(output: &atome::output::OutputClass<f32>) -> Self {
+        Audio::Atome(output.scheduler())
     }
 
     /// Whether video follows an audio clock.
     pub fn is_enabled(&self) -> bool {
-        matches!(self, Audio::Follow(_))
+        !matches!(self, Audio::Off)
     }
 
     /// The timeline every clip will run against.
@@ -78,6 +84,8 @@ impl Audio {
         match self {
             Audio::Off => Monotonic::shared(),
             Audio::Follow(clock) => Arc::clone(clock),
+            #[cfg(feature = "atome")]
+            Audio::Atome(scheduler) => Arc::new(scheduler.clock()),
         }
     }
 }
@@ -90,6 +98,12 @@ impl std::fmt::Debug for Audio {
                 .debug_struct("Audio::Follow")
                 .field("position", &clock.position())
                 .field("running", &clock.is_running())
+                .finish(),
+            #[cfg(feature = "atome")]
+            Audio::Atome(scheduler) => formatter
+                .debug_struct("Audio::Atome")
+                .field("channels", &scheduler.channels())
+                .field("sample_rate", &scheduler.sample_rate())
                 .finish(),
         }
     }
@@ -162,6 +176,7 @@ pub struct Clip {
     hold: Hold,
     looping: bool,
     start_at: Option<Duration>,
+    audio: Option<PathBuf>,
 }
 
 #[derive(Clone, Debug)]
@@ -183,6 +198,7 @@ impl Clip {
             hold: Hold::Forever,
             looping: false,
             start_at: None,
+            audio: None,
         }
     }
 
@@ -262,6 +278,15 @@ impl Clip {
         self.start_at = Some(position);
         self
     }
+
+    /// The sound for a video that has none of its own — the FLAC `import`
+    /// split out, say. A film with its own audio track plays that instead,
+    /// and this is not used. Heard only with [`Audio::atome`]; stills ignore
+    /// it.
+    pub fn audio(mut self, path: impl Into<PathBuf>) -> Self {
+        self.audio = Some(path.into());
+        self
+    }
 }
 
 /// A clip that finished on its own: it ended, ran out its frames, or failed.
@@ -283,6 +308,13 @@ pub(crate) struct Prepared {
     z_index: i32,
     looping: bool,
     start_at: Option<Duration>,
+    /// Where a video's sound comes from: the film itself, or the file it was
+    /// given. `None` for a still, or a silent film.
+    #[cfg_attr(not(feature = "atome"), allow(dead_code))]
+    soundtrack: Option<PathBuf>,
+    /// How long the film runs, for a looping soundtrack.
+    #[cfg_attr(not(feature = "atome"), allow(dead_code))]
+    duration: Duration,
 }
 
 enum Content {
@@ -423,9 +455,21 @@ impl Controls {
             }
         }
 
+        let mut soundtrack = None;
+        let mut duration = Duration::ZERO;
+
         let content = match clip.media {
             Media::Video(path) => {
-                let mut source = VideoSource::from_file(path)?;
+                let mut source = VideoSource::from_file(&path)?;
+
+                // The film's own sound if it has any; otherwise the file
+                // given for it, if one was.
+                soundtrack = if source.info().has_audio() {
+                    Some(path)
+                } else {
+                    clip.audio
+                };
+                duration = source.info().duration;
 
                 if let Some(cache) = cache {
                     source.set_cache(cache)?;
@@ -455,6 +499,8 @@ impl Controls {
             z_index: clip.z_index,
             looping: clip.looping,
             start_at: clip.start_at,
+            soundtrack,
+            duration,
         };
 
         self.commands
@@ -801,7 +847,17 @@ pub(crate) struct Core<W> {
     screens: Vec<Screen<W>>,
     commands: Receiver<Command>,
     shared: Arc<Shared>,
+    #[cfg_attr(not(feature = "atome"), allow(dead_code))]
+    audio: Audio,
+    /// Soundtracks playing, by clip; dropping one stops it.
+    #[cfg(feature = "atome")]
+    soundtracks: HashMap<ClipId, crate::audio::Soundtrack>,
 }
+
+/// How far ahead a clip with sound is started, so its first samples can be
+/// scheduled before they are due and the first picture decoded in time.
+#[cfg(feature = "atome")]
+const PREROLL: Duration = Duration::from_millis(250);
 
 impl<W> Core<W> {
     /// An engine over screens already open, one output each.
@@ -849,6 +905,9 @@ impl<W> Core<W> {
             screens,
             commands,
             shared,
+            audio: audio.clone(),
+            #[cfg(feature = "atome")]
+            soundtracks: HashMap::new(),
         })
     }
 
@@ -861,6 +920,8 @@ impl<W> Core<W> {
                 Command::Add(id, prepared) => self.place(id, *prepared),
                 Command::Stop(id) => {
                     self.compositor.remove_source(&id.key());
+                    #[cfg(feature = "atome")]
+                    self.soundtracks.remove(&id);
                 }
                 Command::Snapshot(monitor, reply) => {
                     let _ = reply.send(self.snapshot(&monitor));
@@ -943,10 +1004,15 @@ impl<W> Core<W> {
         let output = screen.output;
         let key = id.key();
 
+        let start_at = match prepared.content {
+            Content::Video(_) => self.soundtrack(id, &prepared).or(prepared.start_at),
+            Content::Still { .. } => None,
+        };
+
         match prepared.content {
             Content::Video(source) => {
                 self.compositor
-                    .insert_video_at(&key, source, prepared.looping, prepared.start_at);
+                    .insert_video_at(&key, source, prepared.looping, start_at);
             }
             Content::Still { frame, frames } => self.compositor.insert_still(&key, frame, frames),
         }
@@ -1006,7 +1072,43 @@ impl<W> Core<W> {
             })
     }
 
-    fn finish(&self, id: ClipId, error: Option<String>) {
+    /// Starts a video clip's sound through atome, if it has any and the
+    /// engine plays audio, and returns where on the timeline the pictures must
+    /// start to stay with it: the clip's own start, or a moment from now.
+    #[cfg(feature = "atome")]
+    fn soundtrack(&mut self, id: ClipId, prepared: &Prepared) -> Option<Duration> {
+        let Audio::Atome(scheduler) = &self.audio else {
+            return None;
+        };
+        let path = prepared.soundtrack.as_ref()?;
+
+        let at = prepared
+            .start_at
+            .unwrap_or_else(|| self.compositor.clock().position() + PREROLL);
+        let period = (prepared.looping && !prepared.duration.is_zero()).then_some(prepared.duration);
+
+        match crate::audio::Soundtrack::start(path, scheduler.clone(), at, period) {
+            Ok(soundtrack) => {
+                self.soundtracks.insert(id, soundtrack);
+            }
+            // The pictures still play; the reason is reported, not swallowed.
+            Err(error) => lock(&self.shared.ended).push(ClipEnded {
+                id,
+                error: Some(format!("playing without sound: {error}")),
+            }),
+        }
+
+        Some(at)
+    }
+
+    #[cfg(not(feature = "atome"))]
+    fn soundtrack(&mut self, _id: ClipId, _prepared: &Prepared) -> Option<Duration> {
+        None
+    }
+
+    fn finish(&mut self, id: ClipId, error: Option<String>) {
+        #[cfg(feature = "atome")]
+        self.soundtracks.remove(&id);
         lock(&self.shared.active).remove(&id);
         lock(&self.shared.finished).insert(id);
         lock(&self.shared.ended).push(ClipEnded { id, error });
@@ -1236,9 +1338,7 @@ mod tests {
     fn a_generic_file_is_shown_as_what_it_is() {
         let directory = tempfile::TempDir::new().unwrap();
         let path = directory.path().join("not-a-video.mp4");
-        image::save_buffer(&path, &[255; 16], 2, 2, image::ExtendedColorType::Rgba8).unwrap();
-        // `save_buffer` chose PNG from nothing but the name's lack of one —
-        // write it explicitly as PNG bytes under an MP4 name.
+        // A PNG's bytes under an MP4's name.
         let png = directory.path().join("x.png");
         image::save_buffer(&png, &[255; 16], 2, 2, image::ExtendedColorType::Rgba8).unwrap();
         std::fs::copy(&png, &path).unwrap();

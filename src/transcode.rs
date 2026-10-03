@@ -1,6 +1,6 @@
 //! One file in, one file out: demux, decode, scale, encode, mux.
 //!
-//! The pipeline under [`import`](crate::import), with no queue and no proxy —
+//! The pipeline under [`import`](crate::import()), with no queue and no proxy —
 //! it writes exactly one file at the path it is given, at the settings it is
 //! given, and stops at the next frame when told to. Nothing is buffered beyond
 //! a frame or two and the encoder's own lookahead, so a two-hour film costs
@@ -39,8 +39,8 @@ use crate::mux::{self, Muxer, VideoTrack};
 /// and [`Settings::proxy`] the quick, small stand-in `import` writes first.
 #[derive(Clone, Debug)]
 pub struct Settings {
-    /// What to write: `None` for H.264 where the OS can encode it, otherwise
-    /// AV1 (see [`encode::default_encoding`]).
+    /// What to write: `None` for H.264, the default everywhere (see
+    /// [`encode::default_encoding`]); `Some(Encoding::Av1)` for rav1e.
     pub encoding: Option<Encoding>,
     /// 0.0 to 1.0; see [`EncoderConfig::quality`].
     pub quality: f32,
@@ -208,8 +208,9 @@ pub(crate) fn choose_encoding(settings: &Settings) -> Result<Encoding> {
         }
         None => encode::default_encoding(settings.hardware).ok_or_else(|| Error::NoEncoder {
             encoding: Encoding::H264,
-            remedy: "this build writes nothing here: H.264 needs the OS's encoder \
-                     (encode-platform, Apple targets so far) and AV1 needs encode-av1"
+            remedy: "H.264 is the default and only ever the OS's encoder — VideoToolbox, \
+                     Media Foundation, or MediaCodec — and none is usable here (or none in \
+                     the way `hardware` asks). Ask for AV1 explicitly to write it with rav1e"
                 .to_string(),
         }),
     }

@@ -8,8 +8,8 @@
 //!
 //! | Encoding | Backend | Why this one |
 //! |---|---|---|
-//! | H.264 — the default | VideoToolbox (macOS, iOS) | Universal hardware decode, everywhere a file goes. Patent-pooled, so **only ever the OS's encoder** — never x264, never openh264. Media Foundation and MediaCodec take the same place on Windows and Android, later |
-//! | AV1 | `rav1e`, bundled | Royalty-free and pure Rust, so it ships inside every transcode build. Where the OS has no H.264 encoder (Linux today), and whenever asked for |
+//! | H.264 — the default | VideoToolbox (macOS, iOS), Media Foundation (Windows), MediaCodec (Android) | Universal hardware decode, everywhere a file goes. Patent-pooled, so **only ever the OS's encoder** — never x264, never openh264 |
+//! | AV1 | `rav1e`, bundled | Royalty-free and pure Rust, so it ships inside every transcode build. Written only when asked for: vtome cannot yet play it back on most machines |
 //!
 //! # What the files look like
 //!
@@ -69,9 +69,10 @@ pub enum Backend {
     /// Apple's, on macOS and iOS: H.264 in hardware, or in Apple's software
     /// encoder on a Mac when asked.
     VideoToolbox,
-    /// Microsoft's, on Windows. Not implemented yet.
+    /// Microsoft's, on Windows: a vendor's hardware MFT, or Microsoft's
+    /// software one.
     MediaFoundation,
-    /// Google's, on Android. Not implemented yet.
+    /// Google's, on Android: the device's own encoder.
     MediaCodec,
     /// rav1e, in software, for AV1 anywhere.
     Rav1e,
@@ -110,8 +111,9 @@ impl Backend {
             Backend::VideoToolbox => {
                 cfg!(all(feature = "encode-platform", target_vendor = "apple"))
             }
+            Backend::MediaFoundation => cfg!(all(feature = "encode-platform", windows)),
+            Backend::MediaCodec => cfg!(all(feature = "encode-platform", target_os = "android")),
             Backend::Rav1e => cfg!(feature = "encode-av1"),
-            Backend::MediaFoundation | Backend::MediaCodec => false,
         }
     }
 
@@ -322,12 +324,12 @@ pub fn is_available(encoding: Encoding, hardware: Hardware) -> bool {
     !backends_for(encoding, hardware).is_empty()
 }
 
-/// What `import` writes when not told: H.264 where the OS can encode it, AV1
-/// through the bundled rav1e where it cannot. `None` in a build with neither.
+/// What `import` writes when not told: H.264, always — the format every
+/// hardware decoder plays (§15). `None` where the OS offers no H.264 encoder
+/// vtome may use; AV1 is then written only when asked for, since vtome cannot
+/// yet play AV1 back on most machines (§2).
 pub fn default_encoding(hardware: Hardware) -> Option<Encoding> {
-    [Encoding::H264, Encoding::Av1]
-        .into_iter()
-        .find(|encoding| is_available(*encoding, hardware))
+    is_available(Encoding::H264, hardware).then_some(Encoding::H264)
 }
 
 /// An encoder for this configuration.
@@ -383,6 +385,18 @@ fn instantiate(backend: Backend, config: &EncoderConfig) -> Option<Result<Box<dy
         #[cfg(all(feature = "encode-platform", target_vendor = "apple"))]
         Backend::VideoToolbox => Some(
             crate::encode_videotoolbox::VideoToolboxEncoder::new(config)
+                .map(|encoder| Box::new(encoder) as Box<dyn Encoder>),
+        ),
+
+        #[cfg(all(feature = "encode-platform", windows))]
+        Backend::MediaFoundation => Some(
+            crate::media_foundation::MediaFoundationEncoder::new(config)
+                .map(|encoder| Box::new(encoder) as Box<dyn Encoder>),
+        ),
+
+        #[cfg(all(feature = "encode-platform", target_os = "android"))]
+        Backend::MediaCodec => Some(
+            crate::media_codec::MediaCodecEncoder::new(config)
                 .map(|encoder| Box::new(encoder) as Box<dyn Encoder>),
         ),
 

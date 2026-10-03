@@ -341,7 +341,7 @@ fn a_cached_film_plays_the_same_pictures_through_the_joins() {
 
     // Mark the cached pictures, so it is visible which ones came from memory:
     // the moving bar is left alone, the top-left corner is not.
-    let marked: Vec<Frame> = frames.iter().map(|frame| mark(frame)).collect();
+    let marked: Vec<Frame> = frames.iter().map(mark).collect();
 
     let mut source = VideoSource::from_file(FIXTURE).unwrap();
     source

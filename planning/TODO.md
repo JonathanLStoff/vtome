@@ -19,12 +19,19 @@ Ordered roughly by what unblocks what.
 
 **Where things stand.** Identification, both demuxers, the frame and colour
 model, the geometry, placement, the GPU renderer and compositor, the window, the
-clock, H.264 decoding through VideoToolbox, and the `Vtome` engine in both its
-versions are built and tested — GPU tests included, which draw and read the
-pixels back. What is *not* built: H.264 decoding off Apple platforms, AV1
-decoding (§2), and encoding (§4). So vtome today puts stills, and on a Mac H.264
-video, in any convex quadrilateral on any monitor, in layers, from a
-standalone program or from inside a Tauri application.
+clock, H.264 decoding and encoding through the OS (VideoToolbox; Media
+Foundation and MediaCodec compiled and type-checked, not yet run on those
+systems), AV1 encoding through rav1e, the import queue, and the `Vtome` engine
+in both its versions — soundtracks through atome included — are built and
+tested. What is *not* built: H.264 on Linux (VA-API), AV1 *decoding* (§2), and
+the zero-copy paths. So vtome today imports to H.264 and puts stills and H.264
+video, with their sound, in any convex quadrilateral on any monitor.
+
+**No bundled H.264 or AAC codec, anywhere** (asked for 2026-10-03): every H.264
+or AAC encoder and decoder vtome and atome use is the operating system's.
+Symphonia's AAC decoder and libfdk-aac are out of atome; `cargo tree -i` finds
+no AAC or H.264 codec crate in either graph. Linux, which has no OS codec for
+either, refuses both by name.
 
 ---
 
@@ -34,14 +41,16 @@ Written down first because everything else follows from them, and because each
 one is the answer to "what is my best option across iOS, Android, Windows,
 macOS, and Linux".
 
-**Codec scope: decode H.264 and AV1, write AV1. Nothing else** (decided
-2026-09-24). H.264 is what arrives; AV1 is what vtome displays and saves. HEVC
-and VP9 are out of scope in both directions, so the VP9 fallback this plan once
-carried is gone.
+**Codec scope: decode H.264 and AV1, write H.264 and AV1. Nothing else**
+(decided 2026-09-24, write side changed 2026-10-01). HEVC and VP9 are out of
+scope in both directions; the VP9 scaffolding is gone.
 
-**AV1 is the format vtome writes.** AOMedia royalty-free — no per-unit licence,
-no H.264 patent pool — and `rav1e` encodes it in **pure Rust** (nasm only for
-the optional assembly), so a transcode build needs no C toolchain.
+**H.264 is the default output, through the OS encoder only** (2026-10-01): it
+hardware-decodes everywhere a file goes (§15). The encoder is the operating
+system's — VideoToolbox today — so, as for decoding, the licence is the OS
+vendor's; nothing bundled ever encodes H.264. **AV1 is bundled** through
+`rav1e`, pure Rust, in every `transcode` build: written where the OS has no
+H.264 encoder (Linux today) and when asked for.
 
 **Decoding input is the hard half, and the OS is the way through it.** Reading
 H.264 without FFmpeg means one backend per platform: VideoToolbox (macOS, iOS),
@@ -54,8 +63,7 @@ sits a portable software AV1 decoder — dav1d/rav1d — so vtome can always rea
 **H.264 input on Linux is the one open licensing question.** VA-API covers it
 where the driver does; `openh264` compiled from source is the fallback, and
 compiling it yourself is *not* the same as Cisco's royalty-covered binary. Decide
-deliberately (§11), and never *encode* H.264 — that is what this project exists
-to avoid.
+deliberately (§11), and never encode H.264 with anything but the OS's encoder.
 
 **No FFmpeg has a price, and it is paid here:** no free demuxer zoo, no swscale,
 no filters. So scaling, colour conversion, and deinterlacing all happen on the
@@ -70,10 +78,12 @@ containers is the list we write (§1).
 | Image loading | `image` | yes | PNG, JPEG, WebP, GIF, BMP, TIFF |
 | MP4 demux | `mp4` | yes | Also carries AV1 (`av01`) |
 | MKV/WebM demux | `matroska-demuxer` | yes | `webm` crate is libwebm bindings — prefer the Rust one |
-| WebM mux | `webm-iterable` | yes | Writing what §4 encodes |
+| MP4 mux | `mp4` | yes | H.264 out, rewritten faststart |
+| WebM mux | vtome's own | yes | AV1 out; `webm-iterable` was not needed |
 | Video decode (input) | platform APIs | no | VideoToolbox / MediaFoundation / MediaCodec / VA-API |
 | AV1 decode | `dav1d-rs`, or `rav1d` | C / Rust port | `rav1d`'s release state needs checking before we depend on it |
-| AV1 encode | `rav1e` | yes | The reason AV1 is the default |
+| H.264 encode | platform APIs | no | VideoToolbox; never bundled |
+| AV1 encode | `rav1e` | yes | Bundled with every transcode build |
 
 ---
 
@@ -88,20 +98,22 @@ containers is the list we write (§1).
       thing that is painful to change later
 
 ```toml
-default         = ["demux", "decode-av1", "image"]
+default         = ["demux", "image"]
 demux           = ["mp4", "matroska-demuxer"]      # containers
 decode-av1      = []                               # dav1d or rav1d
-decode-vp9      = []                               # libvpx
 decode-platform = []                               # the OS decoder for this target
-encode-av1      = ["rav1e"]                        # transcode target
-encode-vp9      = ["vpx-sys"]                      # transcode fallback
-mux             = ["webm-iterable"]
+encode-platform = []                               # the OS encoder: H.264, never bundled
+encode-av1      = ["rav1e"]                        # bundled AV1
+mux             = ["demux"]                        # MP4 (mp4 crate) and WebM (our own)
 render          = ["wgpu"]                         # GPU present, no window of its own
 window          = ["render", "winit"]              # vtome opens its own windows
 embed           = ["render", "raw-window-handle"]  # someone else's surface
 image           = ["dep:image"]                    # stills
-transcode       = ["demux", "mux", "encode-av1"]
-all-decoders    = ["decode-av1", "decode-vp9", "decode-platform"]
+transcode       = ["demux", "mux", "decode-platform", "encode-platform", "encode-av1"]
+import          = ["transcode"]
+atome           = ["dep:atome"]                    # follow atome's clock
+split-audio     = ["transcode", "atome", "atome/import", "atome/export"]
+all-decoders    = ["decode-av1", "decode-platform"]
 ```
 
 - [x] `README.md` describing what exists, not what is planned
@@ -160,22 +172,25 @@ build actually have.
             reopening the session at the next keyframe
       - [ ] Matroska H.264 with B-frames reorders by a fixed four-frame window;
             reading `max_num_reorder_frames` from the SPS would make it exact
-- [ ] **Windows** — Media Foundation / D3D11VA through the `windows` crate.
-      Output is a D3D11 texture; wgpu's DX12 backend needs it shared, so this is
-      the interop that will take the longest
-- [ ] **Android** — MediaCodec through `ndk`. Decode to a `SurfaceTexture` and
-      sample it as an external texture; never read frames back to the CPU
+- [x] **Windows** — H.264 through Media Foundation (`media_foundation.rs`):
+      a vendor's hardware MFT or Microsoft's software one, NV12 out. Compiled
+      and type-checked; **not yet run on Windows**
+      - [ ] Zero-copy: the D3D11 texture shared with wgpu's DX12 backend — the
+            interop that will take the longest
+- [x] **Android** — H.264 through MediaCodec (`media_codec.rs`), declared by
+      hand against `libmediandk`, NV12 or I420 out. Compiled and type-checked;
+      **not yet run on a device**. Vendor-tiled output layouts are refused by
+      name
+      - [ ] Zero-copy: decode to a `SurfaceTexture` and sample it as an
+            external texture
 - [ ] **Linux** — VA-API (`cros-libva`) with a V4L2-M2M path for ARM boards, and
       a documented "software only" outcome where neither exists
 - [ ] **Portable software AV1** — dav1d via `dav1d-rs`, or `rav1d` if its
       release state holds up. This is the floor: it is what makes "vtome can
-      always play what vtome wrote" true on every target. `decode_av1.rs` is a
-      stub today that returns no frames, so `decode-av1` currently opens AV1
-      files and shows nothing — it should refuse until it decodes
-- [ ] Remove the VP9 scaffolding now that VP9 is out of scope: the
-      `decode-vp9`/`encode-vp9` features, `decode_vp9.rs`, and
-      `Backend::LibVpx`. HEVC and VP9 should be refused as "not in vtome's
-      scope" rather than "not implemented yet"
+      always play what vtome wrote" true on every target. Until then
+      `Av1Decoder::new` refuses by name rather than opening a file and showing
+      nothing, and `import` writes AV1 only when asked (H.264 is the default
+      everywhere, 2026-10-03)
 - [ ] Threading: decode off the render thread, bounded frame queue, backpressure
       rather than unbounded memory
 - [ ] Decoder capability query, so an application can ask *before* opening a file
@@ -353,12 +368,12 @@ a Tauri + React app that owns its own window, and equally able to open its own.
       Android cross-built with the NDK; a native Windows Dockerfile for a
       Windows host; and macOS and iOS, which cannot be containerised, by a
       script run on a Mac
-      - [ ] **Not part of the normal suite** (asked for 2026-10-01): `make test`
+      - [x] **Not part of the normal suite** (asked for 2026-10-01): `make test`
             never runs it, and the Mac run builds into a target directory of
             its own. It used to share `target/`, compiled from a temp copy of
             the source, and left test binaries behind pointing at fixture
             paths that no longer existed — `make test` then failed
-            `mp4_timing` until something forced a rebuild — **In Progress**
+            `mp4_timing` until something forced a rebuild
 - [x] Fixtures written by the test rather than committed, where the format
       allows it — a PNG saved by the same library that reads it cannot drift
       from what the decoder expects
@@ -451,17 +466,19 @@ Asked for 2026-09-24, in the shape OrbitX already stores its outputs:
 (i64, i64, i64, i64)>` and `video_matrix_in` keyed by vtome ids. The engine
 exists in both versions (see CHANGELOG); what is left:
 
-- [ ] **A video's audio goes to atome automatically**, and the video's clock
+- [x] **A video's audio goes to atome automatically**, and the video's clock
       slaves to atome's play position through `MasterClock`. Needs atome's play
       position (atome planning §13) and an optional `atome` feature here
-- [ ] **`import(input, output, options)`**, a free function rather than a
+- [x] **`import(input, output, options)`** (done in §14, writing H.264 by
+      default rather than AV1), a free function rather than a
       method: decode (H.264 through the OS decoder) → encode AV1 with `rav1e` →
       mux (WebM, or AV1-in-MP4 — §11) → write to disk. This is §4's transcode
       with a front door. `rav1e` is software and slow, so §4's progress
       callback and cancellation are part of this, not extras
-      - [ ] Option to split the audio out as FLAC for atome — atome's side is
+      - [x] Option to split the audio out as FLAC for atome — atome's side is
             its planning §3.5 (FLAC writing) and §4 (audio out of video files)
-- [ ] **AAC through the OS, never a bundled decoder** (decided 2026-09-26) — the
+- [x] **AAC through the OS, never a bundled decoder** (decided 2026-09-26,
+      done 2026-10-03 in atome's `import::aac`) — the
       same rule as H.264, for the same reason: the patent licence stays the
       OS vendor's. The audio in an MP4 is nearly always AAC. vtome itself never
       decodes audio, so this means `import`'s audio split and a video's audio
@@ -477,7 +494,7 @@ exists in both versions (see CHANGELOG); what is left:
       reconfigured every frame; the output should close, and reopen when the
       monitor returns, reported through `Controls`
 
-## 14. Import queue, proxies, and one clock — **In Progress**
+## 14. Import queue, proxies, and one clock
 
 Asked for 2026-10-01, replacing the "move the default to VP9" note that stood
 here. The request, as written:
@@ -491,89 +508,93 @@ here. The request, as written:
 > add a clock that is used to control the playback and it is based on the
 > audio atome cpal clock.
 
-### 14.1 Writing: H.264 by default, AV1 bundled — **In Progress**
+### 14.1 Writing: H.264 by default, AV1 bundled
 
-- [ ] `encode`: an `Encoder` trait (frame in, packets out, `finish`, an honest
+- [x] `encode`: an `Encoder` trait (frame in, packets out, `finish`, an honest
       `is_hardware`) and a backend choice shaped like `decode::open`, so "not
       compiled in" and "not on this machine" read differently
-- [ ] **H.264 through the OS encoder, never a bundled one** — VideoToolbox on
+- [x] **H.264 through the OS encoder, never a bundled one** — VideoToolbox on
       Apple targets. No x264, no openh264: the licence stays the OS vendor's,
       the same rule as decoding H.264 and AAC
-      - [ ] Media Foundation (Windows) and MediaCodec (Android), behind the same
-            trait, later
-- [ ] **AV1 through `rav1e`, compiled into every `transcode` build** — the
+      - [x] Media Foundation (Windows) and MediaCodec (Android), behind the same
+            trait, to the same §15 settings — compiled and type-checked, not
+            yet run on those systems
+- [x] **AV1 through `rav1e`, compiled into every `transcode` build** — the
       fallback wherever the OS has no H.264 encoder (Linux today) and the
       choice when asked for. Pure Rust, so bundling it costs build time, not a
       toolchain
-- [ ] Mux: H.264 into MP4 (the `mp4` crate's writer), AV1 into WebM (a small
+- [x] Mux: H.264 into MP4 (the `mp4` crate's writer), AV1 into WebM (a small
       Matroska writer of vtome's own, with Cues so the result seeks). The
       container follows the codec, never the output path's extension
-- [ ] §15's universal baseline is the contract for every H.264 file `import`
+- [x] §15's universal baseline is the contract for every H.264 file `import`
       writes: High profile, **Level 4.1 declared** (never AutoLevel), 8-bit
       4:2:0, no B-frames, a fixed keyframe every 2 s so every GOP is closed,
       and `moov` before `mdat` — the `mp4` crate writes it last, so the file is
       rewritten faststart once the encode ends. VideoToolbox: frame reordering
       off, quality 0.68 (bitrate where the encoder will not take a quality)
-      - [ ] 4.1 holds 8,192 macroblocks a frame and 245,760 a second — 1080p30,
+      - [x] 4.1 holds 8,192 macroblocks a frame and 245,760 a second — 1080p30,
             or 720p60. A picture bigger or faster than that is scaled down to
             fit rather than declared at a level older decoders refuse; a caller
             who wants 4K asks for it (`Level::Auto`)
-- [ ] A small pure-Rust scaler and NV12/I420 conversion — the proxy is
+- [x] A small pure-Rust scaler and NV12/I420 conversion — the proxy is
       downscaled, and rav1e takes planar input
-- [ ] Colour survives the trip: the encoder is told the source's matrix and
+- [x] Colour survives the trip: the encoder is told the source's matrix and
       range, and the MP4 demuxer reads them back from the SPS instead of
       guessing by resolution — which would call a 640×360 proxy of a BT.709
       film BT.601
-- [ ] The VP9 scaffolding goes (§2's item): `decode-vp9`, `encode-vp9`,
+- [x] The VP9 scaffolding goes (§2's item): `decode-vp9`, `encode-vp9`,
       `decode_vp9.rs`, `Backend::LibVpx`
 
-### 14.2 `import`: a proxy now, the real file later — **In Progress**
+### 14.2 `import`: a proxy now, the real file later
 
-- [ ] `import(input, output, output_audio: Option<path>)` returns a job id at
+- [x] `import(input, output, output_audio: Option<path>)` returns a job id at
       once, after checking the input opens and something here decodes it — a
       bad file is an error at the call, not a failed job later
-- [ ] A low-quality proxy is written at `output` first (downscaled, fastest
+- [x] A low-quality proxy is written at `output` first (downscaled, fastest
       settings, H.264 by default) so the application can use that path
       straight away. The full-quality file encodes in a temp directory and
       then replaces the proxy in one rename — copy-then-rename when the temp
       directory is on another volume — so the path never holds half a file
-- [ ] One function reports every file being worked on: stage, fraction done,
+- [x] One function reports every file being worked on: stage, fraction done,
       frames, the codec actually used, whether the proxy is ready, and why a
       job failed
-- [ ] A queue, not a thread per file: one lane for proxies and one for final
+- [x] A queue, not a thread per file: one lane for proxies and one for final
       encodes, so two encoders at most run however many files are imported.
       Proxies have their own lane so a new file is usable without waiting
       behind an hour-long final encode
-- [ ] Cancel a job: queued stages are dropped, a running one stops at the
+- [x] Cancel a job: queued stages are dropped, a running one stops at the
       next frame, temp files are removed
-- [ ] Hardware acceleration is an import option (asked for 2026-10-01):
+- [x] Hardware acceleration is an import option (asked for 2026-10-01):
       `Hardware::Prefer` (the default — hardware where the machine has it,
       the OS's software codec where not), `Require` (hardware or a clear
       refusal at `import`), `Off` (software throughout). It reaches both the
       decoder and the encoder, and the progress report says what each one
       actually used. `Require` with AV1 is refused up front — rav1e is
       software
-- [ ] `output_audio`: the audio split to FLAC through atome's `to_flac`. Its
+- [x] `output_audio`: the audio split to FLAC through atome's `to_flac`. Its
       own feature, `split-audio`, because atome's `import` still decodes AAC
       with Symphonia's bundled decoder until atome §3.3 moves AAC to the OS —
       which §13's rule says vtome must not pull in quietly
 
-### 14.3 One clock for all playback, from atome's cpal stream — **In Progress**
+### 14.3 One clock for all playback, from atome's cpal stream
 
-- [ ] atome: a play-position clock off the cpal output callback — frames
+- [x] atome: a play-position clock off the cpal output callback — frames
       handed to the device, less output latency, smoothed between callbacks,
       readable from any thread without a lock (atome §13)
-- [ ] vtome: every clip runs against one engine timeline instead of a clock of
+- [x] vtome: every clip runs against one engine timeline instead of a clock of
       its own. With audio, the timeline *is* atome's clock, so video follows
       audio and never the reverse (§9); without, a monotonic clock
-- [ ] `start(outputs, backgrounds, audio)`: `Audio::Off`, or
-      `Audio::atome(clock)` with the `atome` feature, or any `MasterClock`
-- [ ] `Clip::start_at(position)` — frame zero lands at that point on the
+- [x] `start(outputs, backgrounds, audio)`: `Audio::Off`, or
+      `Audio::atome(&output)` with the `atome` feature, or any `MasterClock`
+- [x] `Clip::start_at(position)` — frame zero lands at that point on the
       timeline, which is how a video lines up with audio scheduled in atome
-- [ ] A video's own audio still goes to atome by hand; doing it automatically
-      is §13's first item
+- [x] A video's own audio goes to atome automatically (2026-10-03): with
+      `Audio::atome`, each video clip's soundtrack — its own audio track, or
+      the file given with `Clip::audio` when it has none — is decoded by atome
+      and scheduled on the output at the clip's start, one atome voice per
+      clip, so stopping the clip takes its sound back within a buffer
 
-### 14.4 The engine's surface, as sketched — **In Progress**
+### 14.4 The engine's surface, as sketched
 
 The sketch that came with the request, and where each call lands. Both hosts —
 vtome's own winit windows and a Tauri application's — share it.
@@ -590,10 +611,10 @@ vtome's own winit windows and a Tauri application's — share it.
 | `Engine.is_finished(id)` | `is_finished(id)`: ended, failed, or stopped |
 | `Engine.snapshot(id)` | `snapshot(id)`: the clip's current frame. The whole output is `snapshot_output(monitor)` |
 
-- [ ] `is_running`, `is_finished`, `snapshot(id)` / `snapshot_output`
-- [ ] `add_generic`, `add_cached` (and `cache_frames`), which needs §9's seek:
+- [x] `is_running`, `is_finished`, `snapshot(id)` / `snapshot_output`
+- [x] `add_generic`, `add_cached` (and `cache_frames`), which needs §9's seek:
       keyframe, then decode-and-discard
-- [ ] `Started` carries the monitor list
+- [x] `Started` carries the monitor list
 
 
 ## 15. Improve encoding:

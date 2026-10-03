@@ -43,7 +43,7 @@ use crate::render::Gpu;
 /// let outputs = HashMap::from([("monitor_342b0e446031e910".to_string(), (1920, 1080, 0, 0))]);
 /// let backgrounds = HashMap::from([("monitor_342b0e446031e910".to_string(), "#000000FF".to_string())]);
 ///
-/// // No audio: vtome keeps its own clock. `Audio::atome(output.clock())`
+/// // No audio: vtome keeps its own clock. `Audio::atome(&output)`
 /// // would have every clip follow atome's output instead.
 /// vtome.start(outputs, backgrounds, vtome::Audio::Off)?; // runs until `controls.close()`
 /// # Ok::<(), vtome::Error>(())

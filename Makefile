@@ -113,7 +113,7 @@ build: require-manifest
 
 ## test: run the test suite, including the GPU tests and the platform decoder
 test: require-manifest
-	$(CARGO) test --features render,decode-platform
+	$(CARGO) test --features render,decode-platform,window,split-audio
 
 ## test-core: the tests that need no GPU and no optional dependency
 test-core: require-manifest
