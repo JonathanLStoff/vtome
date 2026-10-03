@@ -1,6 +1,6 @@
 [package]
 name = "vtome"
-version = "0.2.4"
+version = "0.2.5"
 edition = "2021"
 authors = ["Jonathan Stoff <JonathanLStoff@gmail.com>"]
 description = "Show images and video on a specific monitor — or a specific quadrilateral of one — with royalty-free codecs and no FFmpeg. GPU presentation with perspective-correct corner pinning, optional windowing, and a frame pipeline that stays in YUV until the shader."
@@ -55,10 +55,8 @@ rav1e = { version = "0.8", optional = true, default-features = false, features =
 # atome is the audio engine: its output's play position is the clock video
 # follows (`atome` feature), and its FLAC writer splits a film's audio out on
 # import (`split-audio`). Default features off — vtome turns on exactly what it
-# uses. `PlayClock` is newer than atome 0.8.2; until atome is released with it,
-# `.cargo/config.toml` (local, not committed) patches this to ../atome. Raise
-# the requirement to that release before publishing.
-atome = { version = "0.8.2", optional = true, default-features = false }
+# uses. 0.8.3 is the first release with `PlayClock`.
+atome = { version = "0.8.3", optional = true, default-features = false }
 
 # --- The operating system's codecs off Apple targets ------------------------
 # Media Foundation on Windows: the H.264 encoder and decoder Windows ships, so

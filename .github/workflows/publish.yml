@@ -200,15 +200,18 @@ jobs:
               ;;
           esac
 
+      # `--locked` so a Cargo.lock that disagrees with the manifest fails here,
+      # by name, rather than being rewritten and then refused as a dirty tree
+      # by the dry run.
       - name: Build
         if: steps.existing.outputs.published == 'false'
-        run: cargo build --verbose
+        run: cargo build --locked --verbose
 
       # `import` only: `import-all` builds libfdk-aac and libopus from source,
       # which is a slow way to find out nothing about this crate's own code.
       - name: Test
         if: steps.existing.outputs.published == 'false'
-        run: cargo test --features import --verbose
+        run: cargo test --locked --features import --verbose
 
       # Packages and builds exactly what would be uploaded, without uploading
       # it — this is where a missing file or a path dependency shows up.
