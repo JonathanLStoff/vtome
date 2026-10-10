@@ -64,6 +64,12 @@ Symphonia's AAC decoder or libfdk-aac, neither of which is compiled into either
 crate. `cargo tree -i` finds no AAC or H.264 codec crate in either dependency
 graph with every feature on.
 
+A transcode can write to a path (`transcode`) or to any
+`Read + Write + Seek + Send` (`transcode_into`) — a file already open, or an
+entry of a [`pfac`](https://crates.io/crates/pfac) bundle, so the result lands
+in the project it belongs to without being written somewhere else first. MP4's
+index is moved to the front inside the destination itself.
+
 **AV1** is royalty-free, so its encoder, `rav1e`, is bundled with every transcode
 build — but written only when asked for: vtome cannot yet play AV1 back on most
 machines (dav1d is planned), and the AV1 decoder refuses by name rather than

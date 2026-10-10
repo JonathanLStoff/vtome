@@ -5,6 +5,20 @@ as it lands (see `.claude/CLAUDE.md` in the sibling crates for the habit).
 
 **Done**
 
+- **Transcode into a writer, not only a path.** `transcode::transcode_into`
+  and `mux::create_in` write the MP4 or WebM to any `mux::Storage`
+  (`Read + Write + Seek + Send`, blanket-implemented): a `Cursor`, an open file,
+  an entry of a `pfac` bundle. WebM patches its size, Cues position, and
+  duration in the writer; MP4 moves `moov` in front of `mdat` in the writer
+  itself (`faststart_in_place`), shifting the media forward last block first
+  rather than renaming over a file somebody else owns, with no second copy.
+  The destination must be at its start and (for MP4) the index must be the last
+  box, as the `mp4` crate leaves it; both are checked. A failed or cancelled
+  transcode leaves its partial output in the writer — there is no path to
+  remove — and says so. The path forms are unchanged and still rewrite by temp
+  file and rename. The import queue stays path-based. 5 unit tests (in-place
+  agrees byte-for-byte with the rewrite, including a widened `co64` index that
+  grows the file) and 3 integration tests
 - **The crate exists.** `vtome` is a library for putting an image or a video on
   a specific monitor — or a specific quadrilateral of one — with no FFmpeg
   anywhere in the dependency tree and no codec anyone charges for. 127 tests

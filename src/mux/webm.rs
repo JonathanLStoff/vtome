@@ -19,12 +19,11 @@
 //! video — and written with its size known, so no element has an unknown
 //! size and a reader can skip any of them.
 
-use std::fs::File;
-use std::io::{BufWriter, Seek, SeekFrom, Write};
+use std::io::{BufWriter, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use super::{frame_duration, mux_error, VideoTrack, Written};
+use super::{frame_duration, mux_error, require_start, Storage, VideoTrack, Written};
 use crate::color::Range;
 use crate::error::{Error, Result};
 use crate::media::Packet;
@@ -93,9 +92,13 @@ const TIMESTAMP_SCALE: u64 = 1_000_000;
 /// milliseconds, so a cluster spans at most this long.
 const CLUSTER_SPAN: u64 = 32_767;
 
-pub(super) struct WebmMuxer {
+pub(super) struct WebmMuxer<W: Storage> {
+    /// The file's path, or what errors call a destination without one.
     path: PathBuf,
-    file: BufWriter<File>,
+    file: BufWriter<W>,
+    /// Run once the file is complete: `sync_all` for a file this made, nothing
+    /// for a destination somebody else owns.
+    settle: fn(&mut W) -> std::io::Result<()>,
     /// Bytes written so far: where the next element starts.
     position: u64,
     /// Where the Segment's payload starts; Matroska positions count from here.
@@ -120,17 +123,26 @@ struct Cluster {
     starts_with_keyframe: bool,
 }
 
-impl WebmMuxer {
-    pub(super) fn create(path: &Path, track: VideoTrack) -> Result<Self> {
+impl<W: Storage> WebmMuxer<W> {
+    /// `open` is called once `track` has been checked, so a configuration this
+    /// cannot write does not leave an empty file behind.
+    pub(super) fn create(
+        open: impl FnOnce() -> Result<W>,
+        path: &Path,
+        settle: fn(&mut W) -> std::io::Result<()>,
+        track: VideoTrack,
+    ) -> Result<Self> {
         if track.config_record.is_empty() {
             return Err(mux_error("an AV1 track needs its av1C record before the first frame"));
         }
 
-        let file = File::create(path).map_err(|error| Error::io(path, error))?;
+        let mut file = open()?;
+        require_start(&mut file, path)?;
 
         let mut muxer = WebmMuxer {
             path: path.to_path_buf(),
             file: BufWriter::new(file),
+            settle,
             position: 0,
             segment_data: 0,
             segment_size_at: 0,
@@ -258,7 +270,7 @@ impl WebmMuxer {
     }
 }
 
-impl super::Muxer for WebmMuxer {
+impl<W: Storage> super::Muxer for WebmMuxer<W> {
     fn write(&mut self, packet: Packet) -> Result<()> {
         if self.last.is_some_and(|last| packet.pts < last) {
             return Err(mux_error(format!(
@@ -349,11 +361,11 @@ impl super::Muxer for WebmMuxer {
         let path = self.path.clone();
         let bytes = self.position;
 
-        self.file
+        let mut file = self
+            .file
             .into_inner()
-            .map_err(|error| Error::io(&path, error.into_error()))?
-            .sync_all()
-            .map_err(|error| Error::io(&path, error))?;
+            .map_err(|error| Error::io(&path, error.into_error()))?;
+        (self.settle)(&mut file).map_err(|error| Error::io(&path, error))?;
 
         Ok(Written {
             samples: self.samples,

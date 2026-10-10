@@ -5,7 +5,7 @@ use std::io::{BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use super::{frame_duration, mux_error, VideoTrack, Written};
+use super::{frame_duration, mux_error, require_start, Storage, VideoTrack, Written};
 use crate::bitstream::AvcConfig;
 use crate::error::{Error, Result};
 use crate::media::Packet;
@@ -13,9 +13,14 @@ use crate::media::Packet;
 /// MP4's own clock for the whole file; tracks keep their own.
 const MOVIE_TIMESCALE: u32 = 1000;
 
-pub(super) struct Mp4Muxer {
+pub(super) struct Mp4Muxer<W: Storage> {
+    /// The file's path, or what errors call a destination without one.
     path: PathBuf,
-    writer: ::mp4::Mp4Writer<BufWriter<File>>,
+    /// Whether the index is moved in `writer` itself rather than by rewriting
+    /// the file at `path` — the difference between a destination somebody else
+    /// owns and one this made.
+    in_place: bool,
+    writer: ::mp4::Mp4Writer<BufWriter<W>>,
     /// Ticks a second on the track's clock: one that divides the frame
     /// duration exactly, so 29.97 stays 29.97.
     timescale: u32,
@@ -27,8 +32,15 @@ pub(super) struct Mp4Muxer {
     end: Duration,
 }
 
-impl Mp4Muxer {
-    pub(super) fn create(path: &Path, track: VideoTrack) -> Result<Self> {
+impl<W: Storage> Mp4Muxer<W> {
+    /// `open` is called once `track` has been checked, so a configuration this
+    /// cannot write does not leave an empty file behind.
+    pub(super) fn create(
+        open: impl FnOnce() -> Result<W>,
+        path: &Path,
+        in_place: bool,
+        track: VideoTrack,
+    ) -> Result<Self> {
         let avc = AvcConfig::parse(&track.config_record)?;
         let (Some(sps), Some(pps)) = (
             avc.sequence_parameter_sets.first(),
@@ -51,7 +63,8 @@ impl Mp4Muxer {
             )));
         };
 
-        let file = File::create(path).map_err(|error| Error::io(path, error))?;
+        let mut file = open()?;
+        require_start(&mut file, path)?;
 
         let config = ::mp4::Mp4Config {
             major_brand: brand("isom"),
@@ -88,6 +101,7 @@ impl Mp4Muxer {
 
         Ok(Mp4Muxer {
             path: path.to_path_buf(),
+            in_place,
             writer,
             timescale,
             frame: frame_duration(rate),
@@ -129,7 +143,7 @@ impl Mp4Muxer {
     }
 }
 
-impl super::Muxer for Mp4Muxer {
+impl<W: Storage> super::Muxer for Mp4Muxer<W> {
     fn write(&mut self, packet: Packet) -> Result<()> {
         if let Some(previous) = self.pending.take() {
             if packet.dts < previous.dts {
@@ -161,18 +175,25 @@ impl super::Muxer for Mp4Muxer {
         let samples = self.samples;
         let duration = self.end.saturating_sub(self.first.unwrap_or_default());
 
-        self.writer
+        // Flushes what the buffer holds, and hands back what it was writing to.
+        let mut inner = self
+            .writer
             .into_writer()
             .into_inner()
-            .map_err(|error| Error::io(&path, error.into_error()))?
-            .sync_all()
-            .map_err(|error| Error::io(&path, error))?;
+            .map_err(|error| Error::io(&path, error.into_error()))?;
 
-        faststart(&path)?;
+        let bytes = if self.in_place {
+            faststart_in_place(&mut inner, &path)?
+        } else {
+            // A file this made: closed first, since the rewrite opens it by
+            // path and renames over it.
+            drop(inner);
+            faststart(&path)?;
 
-        let bytes = std::fs::metadata(&path)
-            .map_err(|error| Error::io(&path, error))?
-            .len();
+            std::fs::metadata(&path)
+                .map_err(|error| Error::io(&path, error))?
+                .len()
+        };
 
         Ok(Written {
             samples,
@@ -202,7 +223,7 @@ struct TopBox {
 }
 
 /// The top-level boxes of the file, in order.
-fn top_boxes(file: &mut File, length: u64) -> std::io::Result<Vec<TopBox>> {
+fn top_boxes(file: &mut (impl Read + Seek), length: u64) -> std::io::Result<Vec<TopBox>> {
     let mut boxes = Vec::new();
     let mut offset = 0;
 
@@ -240,20 +261,22 @@ fn top_boxes(file: &mut File, length: u64) -> std::io::Result<Vec<TopBox>> {
     Ok(boxes)
 }
 
-/// Moves `moov` in front of `mdat`, so a player has the index before the
-/// media rather than after it.
-///
-/// The `mp4` crate writes the index last because only then is it known. This
-/// writes a new file — everything before `mdat`, then the index with every
-/// chunk offset moved down by its own length, then the rest — and renames it
-/// over the old one, copying the media through in blocks rather than holding
-/// it. An offset pushed past four gigabytes turns its `stco` into a `co64`.
-pub(crate) fn faststart(path: &Path) -> Result<()> {
+/// What moving the index to the front comes to, worked out before anything
+/// is changed.
+struct Reorder {
+    boxes: Vec<TopBox>,
+    moov: TopBox,
+    mdat: TopBox,
+    /// The index as it will be written: every chunk offset already moved down
+    /// by this box's own length.
+    index: Vec<u8>,
+}
+
+/// Works out the reorder, or `None` if the index is already first.
+fn reorder(file: &mut (impl Read + Seek), length: u64, path: &Path) -> Result<Option<Reorder>> {
     let io = |error| Error::io(path, error);
 
-    let mut file = File::open(path).map_err(io)?;
-    let length = file.metadata().map_err(io)?.len();
-    let boxes = top_boxes(&mut file, length).map_err(io)?;
+    let boxes = top_boxes(file, length).map_err(io)?;
 
     let find = |kind: &[u8; 4]| boxes.iter().find(|entry| &entry.kind == kind).copied();
 
@@ -265,7 +288,7 @@ pub(crate) fn faststart(path: &Path) -> Result<()> {
     };
 
     if moov.offset < mdat.offset {
-        return Ok(());
+        return Ok(None);
     }
 
     let mut index = vec![0_u8; moov.size as usize];
@@ -282,6 +305,35 @@ pub(crate) fn faststart(path: &Path) -> Result<()> {
             let wide = shift_offsets(&index, 0, true)?;
             shift_offsets(&index, wide.len() as u64, true)?
         }
+    };
+
+    Ok(Some(Reorder {
+        boxes,
+        moov,
+        mdat,
+        index,
+    }))
+}
+
+/// Moves `moov` in front of `mdat`, so a player has the index before the
+/// media rather than after it.
+///
+/// The `mp4` crate writes the index last because only then is it known. This
+/// writes a new file — everything before `mdat`, then the index with every
+/// chunk offset moved down by its own length, then the rest — and renames it
+/// over the old one, copying the media through in blocks rather than holding
+/// it. An offset pushed past four gigabytes turns its `stco` into a `co64`.
+pub(crate) fn faststart(path: &Path) -> Result<()> {
+    let io = |error| Error::io(path, error);
+
+    let mut file = File::open(path).map_err(io)?;
+    let length = file.metadata().map_err(io)?.len();
+
+    let Some(Reorder {
+        boxes, mdat, index, ..
+    }) = reorder(&mut file, length, path)?
+    else {
+        return Ok(());
     };
 
     let temporary = path.with_extension("faststart-partial");
@@ -315,6 +367,74 @@ pub(crate) fn faststart(path: &Path) -> Result<()> {
         let _ = std::fs::remove_file(&temporary);
         Error::io(path, error)
     })
+}
+
+/// How much of the media is moved at a time.
+const MOVE_BLOCK: usize = 1 << 20;
+
+/// [`faststart`] for a destination that is not a path: the same file, the same
+/// result, rearranged where it lies.
+///
+/// A file somebody else owns cannot be renamed over, so the media is shifted
+/// forward by the index's length — last block first, so nothing is overwritten
+/// before it has been moved — and the index is written into the gap. Needs the
+/// index to be the last box, which is how the `mp4` crate leaves it, and
+/// needs no second copy of the file anywhere.
+///
+/// Returns the file's length.
+pub(crate) fn faststart_in_place(file: &mut impl Storage, path: &Path) -> Result<u64> {
+    let io = |error| Error::io(path, error);
+
+    let length = file.seek(SeekFrom::End(0)).map_err(io)?;
+
+    let Some(Reorder {
+        boxes, moov, mdat, index,
+    }) = reorder(file, length, path)?
+    else {
+        return Ok(length);
+    };
+
+    if boxes.last().is_none_or(|last| last.offset != moov.offset) {
+        return Err(mux_error(format!(
+            "{}: the index is not the last box, and a file cannot be rearranged in place around it",
+            path.display()
+        )));
+    }
+
+    let gap = index.len() as u64;
+
+    // A shorter index would leave the tail of the old one behind, and a
+    // destination that is only a writer cannot be cut short.
+    if gap < moov.size {
+        return Err(mux_error(format!(
+            "{}: the rewritten index is shorter than the one it replaces",
+            path.display()
+        )));
+    }
+
+    let mut block = vec![0_u8; MOVE_BLOCK];
+    let mut remaining = moov.offset - mdat.offset;
+
+    while remaining > 0 {
+        let take = remaining.min(MOVE_BLOCK as u64) as usize;
+        let from = mdat.offset + remaining - take as u64;
+
+        file.seek(SeekFrom::Start(from)).map_err(io)?;
+        file.read_exact(&mut block[..take]).map_err(io)?;
+        file.seek(SeekFrom::Start(from + gap)).map_err(io)?;
+        file.write_all(&block[..take]).map_err(io)?;
+
+        remaining -= take as u64;
+    }
+
+    file.seek(SeekFrom::Start(mdat.offset)).map_err(io)?;
+    file.write_all(&index).map_err(io)?;
+
+    let end = moov.offset + gap;
+    file.seek(SeekFrom::Start(end)).map_err(io)?;
+    file.flush().map_err(io)?;
+
+    Ok(end)
 }
 
 /// Box types whose payload is boxes, on the way from `moov` to a chunk table.
@@ -547,5 +667,103 @@ mod tests {
         // Already in order: left alone.
         faststart(&path).unwrap();
         assert_eq!(std::fs::read(&path).unwrap(), rewritten);
+    }
+
+    /// A file as the `mp4` crate leaves it: `ftyp`, `mdat`, then `moov` last.
+    fn index_last(mdat_len: usize, offsets: &[u32]) -> Vec<u8> {
+        let media: Vec<u8> = (0..mdat_len).map(|index| (index % 251) as u8).collect();
+
+        [
+            boxed(b"ftyp", b"isom\0\0\x02\0isomiso2avc1mp41"),
+            boxed(b"mdat", &media),
+            moov(stco(offsets)),
+        ]
+        .concat()
+    }
+
+    fn boxes_of(bytes: &[u8]) -> Vec<[u8; 4]> {
+        top_boxes(&mut std::io::Cursor::new(bytes), bytes.len() as u64)
+            .unwrap()
+            .into_iter()
+            .map(|entry| entry.kind)
+            .collect()
+    }
+
+    /// The rearrangement in place must give the bytes the rewrite-and-rename
+    /// gives. `mdat_len` is more than a block, so the media is moved in several
+    /// pieces and the last-block-first order is exercised.
+    #[test]
+    fn rearranging_in_place_gives_what_rewriting_the_file_gives() {
+        let original = index_last(MOVE_BLOCK * 5 / 2 + 123, &[40, 1_000, 52_000]);
+
+        let directory = tempfile::TempDir::new().unwrap();
+        let path = directory.path().join("rewritten.mp4");
+        std::fs::write(&path, &original).unwrap();
+        faststart(&path).unwrap();
+        let rewritten = std::fs::read(&path).unwrap();
+
+        let mut stream = std::io::Cursor::new(original.clone());
+        let length = faststart_in_place(&mut stream, Path::new("stream")).unwrap();
+
+        assert_eq!(stream.get_ref(), &rewritten);
+        assert_eq!(length, rewritten.len() as u64);
+        assert_eq!(stream.position(), length, "left at the end, for whoever writes next");
+        assert_eq!(
+            boxes_of(stream.get_ref()),
+            [*b"ftyp", *b"moov", *b"mdat"],
+            "the index is first"
+        );
+    }
+
+    /// A table that has to widen makes the index longer, so the file grows: the
+    /// in-place version has to write past the old end rather than stop there.
+    #[test]
+    fn a_widened_index_grows_the_file_in_place() {
+        let original = index_last(3_000, &[u32::MAX - 10, 100]);
+
+        let directory = tempfile::TempDir::new().unwrap();
+        let path = directory.path().join("rewritten.mp4");
+        std::fs::write(&path, &original).unwrap();
+        faststart(&path).unwrap();
+        let rewritten = std::fs::read(&path).unwrap();
+
+        let mut stream = std::io::Cursor::new(original.clone());
+        let length = faststart_in_place(&mut stream, Path::new("stream")).unwrap();
+
+        assert_eq!(rewritten.len(), original.len() + 8);
+        assert_eq!(stream.get_ref(), &rewritten);
+        assert_eq!(length, rewritten.len() as u64);
+    }
+
+    #[test]
+    fn a_file_already_in_order_is_left_alone_in_place() {
+        let original = [
+            boxed(b"ftyp", b"isom\0\0\x02\0"),
+            moov(stco(&[40])),
+            boxed(b"mdat", &[1, 2, 3]),
+        ]
+        .concat();
+
+        let mut stream = std::io::Cursor::new(original.clone());
+        let length = faststart_in_place(&mut stream, Path::new("stream")).unwrap();
+
+        assert_eq!(stream.into_inner(), original);
+        assert_eq!(length, original.len() as u64);
+    }
+
+    #[test]
+    fn an_index_that_is_not_last_is_refused_in_place_rather_than_corrupted() {
+        let original = [
+            boxed(b"ftyp", b"isom\0\0\x02\0"),
+            boxed(b"mdat", &[1, 2, 3]),
+            moov(stco(&[40])),
+            boxed(b"free", &[0; 16]),
+        ]
+        .concat();
+
+        let mut stream = std::io::Cursor::new(original.clone());
+
+        assert!(faststart_in_place(&mut stream, Path::new("stream")).is_err());
+        assert_eq!(stream.into_inner(), original, "refused before anything was moved");
     }
 }

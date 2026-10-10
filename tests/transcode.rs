@@ -16,12 +16,13 @@
 
 #![cfg(all(target_vendor = "apple", feature = "transcode"))]
 
+use std::io::{Cursor, Read, Seek, SeekFrom};
 use std::path::Path;
 use std::sync::atomic::AtomicBool;
 
 use vtome::bitstream::{AvcConfig, SequenceParameterSet};
 use vtome::color::Matrix;
-use vtome::transcode::{transcode, Settings};
+use vtome::transcode::{transcode, transcode_into, Settings};
 use vtome::{Container, Encoding, Frame, Hardware, VideoSource};
 
 const FIXTURE: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/data/bars_h264.mp4");
@@ -265,4 +266,101 @@ fn an_input_that_will_not_open_writes_nothing() {
 
     assert!(result.is_err());
     assert!(!output.exists());
+}
+
+/// The same transcode into a `Cursor` as into a path: the MP4 is rearranged in
+/// the destination itself, and the result plays back as the path's does.
+#[test]
+fn h264_into_a_writer_is_faststart_and_plays_back_like_the_path() {
+    let directory = tempfile::TempDir::new().unwrap();
+    let by_path = directory.path().join("path.mp4");
+    let by_writer = directory.path().join("writer.mp4");
+
+    let path_summary =
+        transcode(FIXTURE, &by_path, &Settings::default(), |_| {}, &AtomicBool::new(false)).unwrap();
+
+    let mut sink = Cursor::new(Vec::new());
+    let summary = transcode_into(
+        FIXTURE,
+        &mut sink,
+        &Settings::default(),
+        |_| {},
+        &AtomicBool::new(false),
+    )
+    .expect("the fixture transcodes into a writer");
+
+    assert_eq!(summary.bytes, sink.get_ref().len() as u64);
+    assert_eq!(sink.position(), summary.bytes, "left at the end");
+    assert_eq!(
+        (summary.frames, summary.encoding, summary.container),
+        (path_summary.frames, path_summary.encoding, path_summary.container)
+    );
+
+    std::fs::write(&by_writer, sink.get_ref()).unwrap();
+
+    let boxes = top_boxes(&by_writer);
+    assert_eq!(boxes, top_boxes(&by_path), "the same layout, index first");
+    assert!(boxes.iter().position(|kind| kind == "moov") < boxes.iter().position(|kind| kind == "mdat"));
+
+    let original = decode_all(Path::new(FIXTURE));
+    let written = decode_all(&by_writer);
+    assert_eq!(written.len(), original.len());
+
+    for (index, (before, after)) in original.iter().zip(&written).enumerate() {
+        let (before, after) = (bar_position(before), bar_position(after));
+        assert!(
+            (before - after).abs() < 0.02,
+            "frame {index}: the bar moved from {before:.3} to {after:.3}"
+        );
+    }
+}
+
+#[test]
+fn av1_into_a_writer_is_a_webm_that_reads_back() {
+    let directory = tempfile::TempDir::new().unwrap();
+    let output = directory.path().join("writer.webm");
+
+    let settings = Settings {
+        encoding: Some(Encoding::Av1),
+        realtime: true,
+        ..Settings::default()
+    };
+
+    let mut sink = Cursor::new(Vec::new());
+    let summary = transcode_into(FIXTURE, &mut sink, &settings, |_| {}, &AtomicBool::new(false)).unwrap();
+
+    assert_eq!((summary.encoding, summary.container), (Encoding::Av1, Container::WebM));
+    assert_eq!(summary.bytes, sink.get_ref().len() as u64);
+
+    std::fs::write(&output, sink.get_ref()).unwrap();
+
+    let mut demuxer = vtome::open_media(&output).unwrap();
+    assert_eq!(demuxer.info().container, Container::WebM);
+
+    let mut packets = 0;
+    while demuxer.next_packet().unwrap().is_some() {
+        packets += 1;
+    }
+    assert_eq!(packets, FRAMES);
+
+    // The patched slots — segment size, Cues position, duration — are what let
+    // it seek, and they were patched in the writer rather than in a file.
+    demuxer.seek(std::time::Duration::from_millis(500)).unwrap();
+    assert!(demuxer.next_packet().unwrap().is_some());
+}
+
+#[test]
+fn a_writer_that_is_not_at_its_start_is_refused() {
+    let mut sink = Cursor::new(vec![0_u8; 16]);
+    sink.seek(SeekFrom::End(0)).unwrap();
+
+    let result = transcode_into(FIXTURE, &mut sink, &Settings::default(), |_| {}, &AtomicBool::new(false));
+
+    assert!(result.is_err(), "a file cannot begin partway into a stream");
+    assert_eq!(sink.get_ref().len(), 16, "nothing was written over what was there");
+
+    let mut rewound = Vec::new();
+    sink.seek(SeekFrom::Start(0)).unwrap();
+    sink.read_to_end(&mut rewound).unwrap();
+    assert_eq!(rewound, vec![0_u8; 16]);
 }

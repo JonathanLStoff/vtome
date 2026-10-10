@@ -20,6 +20,11 @@
 //! println!("{} frames of {} at {}×{}", summary.frames, summary.encoding, summary.width, summary.height);
 //! # Ok::<(), vtome::Error>(())
 //! ```
+//!
+//! The output can be something other than a path — [`transcode_into`] writes
+//! to any [`Storage`](crate::mux::Storage): a file already open, or an entry of
+//! a `pfac` bundle, so a transcode lands in the project it belongs to without
+//! being written somewhere else first.
 
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -31,7 +36,7 @@ use crate::error::{Error, Result};
 use crate::frame::Frame;
 use crate::identify::{Container, Encoding};
 use crate::media::{Packet, Rational};
-use crate::mux::{self, Muxer, VideoTrack};
+use crate::mux::{self, Muxer, Storage, VideoTrack};
 
 /// How to write a file.
 ///
@@ -149,7 +154,7 @@ pub fn transcode(
 ) -> Result<Summary> {
     let (input, output) = (input.as_ref(), output.as_ref());
 
-    let result = Pipeline::open(input, output, settings)
+    let result = Pipeline::open(input, Output::Path(output), settings)
         .and_then(|pipeline| pipeline.run(&mut progress, cancel));
 
     if result.is_err() {
@@ -157,6 +162,51 @@ pub fn transcode(
     }
 
     result
+}
+
+/// [`transcode`], into `output` rather than a path.
+///
+/// `output` must be empty and positioned at its start. It is written as a file
+/// is — headers patched afterwards, the MP4 index moved to the front — which
+/// is why it has to read and seek as well as write, and why a bundle entry is
+/// a scratch file until it is finished. When this returns `Ok` it holds a
+/// complete file, flushed and positioned at its end.
+///
+/// Pass `&mut output` to keep hold of it. **A failed or cancelled transcode
+/// leaves whatever it had written in `output`**: there is no path to remove, and
+/// what to do with a half-written destination — drop an unfinished bundle
+/// entry, truncate a file — is its owner's call.
+///
+/// ```no_run
+/// use std::io::Cursor;
+/// use std::sync::atomic::AtomicBool;
+/// use vtome::transcode::{transcode_into, Settings};
+///
+/// let mut mp4 = Cursor::new(Vec::new());
+/// let summary = transcode_into(
+///     "camera.mov",
+///     &mut mp4,
+///     &Settings::default(),
+///     |_| {},
+///     &AtomicBool::new(false),
+/// )?;
+/// assert_eq!(summary.bytes, mp4.get_ref().len() as u64);
+/// # Ok::<(), vtome::Error>(())
+/// ```
+///
+/// # Errors
+///
+/// As [`transcode`], and [`Error::Encode`] for an `output` that is not at its
+/// start.
+pub fn transcode_into(
+    input: impl AsRef<Path>,
+    mut output: impl Storage,
+    settings: &Settings,
+    mut progress: impl FnMut(Progress),
+    cancel: &AtomicBool,
+) -> Result<Summary> {
+    Pipeline::open(input.as_ref(), Output::Storage(Some(&mut output)), settings)
+        .and_then(|pipeline| pipeline.run(&mut progress, cancel))
 }
 
 /// What a transcode would write for `input` under `settings`, worked out
@@ -252,7 +302,7 @@ fn no_video(path: &Path) -> Error {
 
 /// A transcode under way.
 struct Pipeline<'a> {
-    output: &'a Path,
+    output: Output<'a>,
     demuxer: Box<dyn crate::demux::Demuxer>,
     decoder: Box<dyn crate::decode::Decoder>,
     track_id: u32,
@@ -267,7 +317,7 @@ struct Pipeline<'a> {
     /// That colour, as the encoder was told it.
     color: crate::color::ColorSpace,
     /// Opened once the encoder can say what its stream is.
-    muxer: Option<Box<dyn Muxer>>,
+    muxer: Option<Box<dyn Muxer + 'a>>,
     /// Packets waiting for the muxer to open.
     waiting: Vec<Packet>,
     /// The first picture's timestamp: the output starts at zero.
@@ -275,8 +325,15 @@ struct Pipeline<'a> {
     frames: u64,
 }
 
+/// Where the pipeline's file goes.
+enum Output<'a> {
+    Path(&'a Path),
+    /// Taken when the muxer is opened, which happens once.
+    Storage(Option<&'a mut dyn Storage>),
+}
+
 impl<'a> Pipeline<'a> {
-    fn open(input: &Path, output: &'a Path, settings: &Settings) -> Result<Self> {
+    fn open(input: &Path, output: Output<'a>, settings: &Settings) -> Result<Self> {
         let demuxer = crate::open_media(input)?;
         let track = demuxer.info().video().ok_or_else(|| no_video(input))?.clone();
 
@@ -439,17 +496,22 @@ impl<'a> Pipeline<'a> {
                 return Ok(());
             };
 
-            self.muxer = Some(mux::create(
-                self.output,
-                VideoTrack {
-                    encoding: self.encoding,
-                    width: self.width,
-                    height: self.height,
-                    frame_rate: self.frame_rate,
-                    color: self.color,
-                    config_record: record,
-                },
-            )?);
+            let track = VideoTrack {
+                encoding: self.encoding,
+                width: self.width,
+                height: self.height,
+                frame_rate: self.frame_rate,
+                color: self.color,
+                config_record: record,
+            };
+
+            self.muxer = Some(match &mut self.output {
+                Output::Path(path) => mux::create(path, track)?,
+                Output::Storage(storage) => {
+                    let storage = storage.take().expect("the muxer is opened once");
+                    mux::create_in(storage, track)?
+                }
+            });
         }
 
         let muxer = self.muxer.as_mut().expect("opened above");
