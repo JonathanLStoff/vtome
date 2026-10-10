@@ -108,6 +108,9 @@ pub struct Progress {
     pub fraction: f32,
 }
 
+/// The bit depth every transcode writes.
+const OUTPUT_BIT_DEPTH: u8 = 8;
+
 /// What a finished transcode wrote.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Summary {
@@ -121,6 +124,11 @@ pub struct Summary {
     pub width: u32,
     /// Picture height written.
     pub height: u32,
+    /// Pictures a second, as written. Exact: 30000/1001 stays that, not 29.97.
+    pub frame_rate: Rational,
+    /// Bits per sample, per component. Always 8 today: both encoders write
+    /// 8-bit 4:2:0, and a 10-bit source is brought down to it.
+    pub bit_depth: u8,
     /// Pictures written.
     pub frames: u64,
     /// How long it plays.
@@ -419,6 +427,8 @@ impl<'a> Pipeline<'a> {
             encoder: encoder.backend(),
             width: self.width,
             height: self.height,
+            frame_rate: self.frame_rate,
+            bit_depth: OUTPUT_BIT_DEPTH,
             frames: written.samples,
             duration: written.duration,
             bytes: written.bytes,

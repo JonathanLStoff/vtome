@@ -5,6 +5,18 @@ as it lands (see `.claude/CLAUDE.md` in the sibling crates for the habit).
 
 **Done**
 
+- **`transcode::Summary` carries `frame_rate` and `bit_depth`.** `frame_rate` is
+  the exact `Rational` the file was written at (30000/1001 stays that, not
+  29.97), and `bit_depth` is bits per sample per component — 8 today, since both
+  encoders write 8-bit 4:2:0 and bring a 10-bit source down to it. Additive to
+  the struct, so code that builds a `Summary` by hand needs the two fields
+- **`examples/split_audio.rs`** (`make split-audio FILE=clip.mov`): transcodes a
+  video into the default encoding and splits its soundtrack to FLAC, twice —
+  to paths with `transcode` and atome's `to_flac`, and to writers with
+  `transcode_into` and `to_flac_into`, both into entries of one pfac bundle. A
+  video with no audio gets no FLAC rather than an error. Adds `pfac` as a
+  dev-dependency (examples only) and raises the `atome` requirement to 0.8.4,
+  the release with `to_flac_into`
 - **Transcode into a writer, not only a path.** `transcode::transcode_into`
   and `mux::create_in` write the MP4 or WebM to any `mux::Storage`
   (`Read + Write + Seek + Send`, blanket-implemented): a `Cursor`, an open file,

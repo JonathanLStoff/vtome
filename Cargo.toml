@@ -1,6 +1,6 @@
 [package]
 name = "vtome"
-version = "0.2.6"
+version = "0.2.7"
 edition = "2021"
 authors = ["Jonathan Stoff <JonathanLStoff@gmail.com>"]
 description = "Show images and video on a specific monitor — or a specific quadrilateral of one — with royalty-free codecs and no FFmpeg. GPU presentation with perspective-correct corner pinning, optional windowing, and a frame pipeline that stays in YUV until the shader."
@@ -56,7 +56,7 @@ rav1e = { version = "0.8", optional = true, default-features = false, features =
 # follows (`atome` feature), and its FLAC writer splits a film's audio out on
 # import (`split-audio`). Default features off — vtome turns on exactly what it
 # uses. 0.8.3 is the first release with `PlayClock`.
-atome = { version = "0.8.3", optional = true, default-features = false }
+atome = { version = "0.8.4", optional = true, default-features = false }
 
 # --- The operating system's codecs off Apple targets ------------------------
 # Media Foundation on Windows: the H.264 encoder and decoder Windows ships, so
@@ -126,6 +126,9 @@ image = ["dep:image"]
 
 [dev-dependencies]
 tempfile = "3"
+# Only for `examples/split_audio.rs`, which writes a transcode and its audio
+# into a bundle through `transcode_into` and `to_flac_into`.
+pfac = "0.8.2"
 # The integration tests write their own image fixtures rather than carrying
 # binary files, so the decoder and the fixture can never disagree.
 image = { version = "0.25", default-features = false, features = ["png"] }
@@ -147,6 +150,10 @@ required-features = ["window", "demux", "decode-platform"]
 [[example]]
 name = "engine"
 required-features = ["window", "demux", "image", "decode-platform"]
+
+[[example]]
+name = "split_audio"
+required-features = ["split-audio"]
 
 [[example]]
 name = "contact_sheet"

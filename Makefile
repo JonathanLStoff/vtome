@@ -12,6 +12,8 @@ CARGO ?= cargo
 # --- `make show` / `make identify` ----------------------------------------
 # The file to show or identify.
 FILE ?=
+# Where `make split-audio` writes. Defaults to target/example/split.
+OUT ?=
 # Which monitor: an index, or part of its name. `make monitors` lists them.
 MONITOR ?=
 # Corner-pin the picture into a trapezoid, narrowing the top edge by this
@@ -42,7 +44,7 @@ SYSTEMS ?=
 
 .DEFAULT_GOAL := help
 .PHONY: help build test docker-test check fmt clippy doc clean release \
-        show monitors play contact-sheet identify corner-pin require-cargo require-manifest \
+        show monitors play contact-sheet split-audio identify corner-pin require-cargo require-manifest \
         require-file require-version
 
 # --- checks ---------------------------------------------------------------
@@ -96,6 +98,10 @@ play: require-manifest require-file
 ## contact-sheet: decode a whole video and save six frames as one PNG (make contact-sheet FILE=clip.mp4)
 contact-sheet: require-manifest require-file
 	$(CARGO) run $(PROFILE) --features render,decode-platform --example contact_sheet -- "$(FILE)"
+
+## split-audio: transcode a video and split its audio to FLAC, by path and into a bundle (make split-audio FILE=clip.mov)
+split-audio: require-manifest require-file
+	$(CARGO) run $(PROFILE) --features split-audio --example split_audio -- "$(FILE)" $(OUT)
 
 ## identify: say what a file is, and what is inside it (make identify FILE=clip.mp4)
 identify: require-manifest require-file
@@ -180,3 +186,4 @@ help:
 	@echo "    make monitors"
 	@echo "    make show FILE=poster.png MONITOR=1 KEYSTONE=0.15"
 	@echo "    make identify FILE=clip.mp4"
+	@echo "    make split-audio FILE=clip.mov"

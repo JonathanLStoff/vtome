@@ -107,6 +107,8 @@ fn h264_is_written_to_the_spec_and_plays_back_frame_for_frame() {
     assert_eq!(summary.encoding, Encoding::H264, "H.264 is the default");
     assert_eq!(summary.container, Container::Mp4);
     assert_eq!((summary.width, summary.height), (128, 96));
+    assert_eq!(summary.frame_rate.as_f64().round(), 24.0);
+    assert_eq!(summary.bit_depth, 8);
     assert_eq!(summary.frames, FRAMES);
     assert!(summary.duration.as_millis().abs_diff(1000) <= 1, "{:?}", summary.duration);
 
@@ -198,6 +200,7 @@ fn av1_goes_into_a_webm_that_reads_back() {
 
     let summary = transcode(FIXTURE, &output, &settings, |_| {}, &AtomicBool::new(false)).unwrap();
     assert_eq!((summary.encoding, summary.container), (Encoding::Av1, Container::WebM));
+    assert_eq!((summary.frame_rate.as_f64().round(), summary.bit_depth), (24.0, 8));
     assert_eq!(summary.frames, FRAMES);
     assert!(!summary.encoder_hardware);
 
