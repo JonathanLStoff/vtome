@@ -5,6 +5,21 @@ as it lands (see `.claude/CLAUDE.md` in the sibling crates for the habit).
 
 **Done**
 
+- **0.3.0: `TauriVtome` outputs can be right-clicked, cover the macOS menu
+  bar, and be hidden.** `on_right_click(|monitor, window| …)` is called on the
+  main thread when an output is right-clicked (it needs `click_through(false)`;
+  clicks outside an output's rectangle are never its): an application-local
+  `NSEvent` monitor on macOS, a window subclass hearing `WM_RBUTTONUP` on
+  Windows, a GTK `button-press-event` handler on Linux — bare windows report no
+  mouse input through Tauri. `cover_menu_bar(true)` raises the outputs to
+  `NSStatusWindowLevel` on macOS, above the menu bar and the Dock (a no-op
+  elsewhere). `window(monitor)`, `hide(monitor)`, `hide_all()` and `show_all()`
+  reach the open outputs; a hidden output keeps playing, unseen. The `tauri`
+  feature now brings `objc2` / `block2` / `objc2-app-kit` on macOS, `gtk` on
+  Linux, and the `windows` crate's `Win32_UI_Shell` /
+  `Win32_UI_WindowsAndMessaging` on Windows — all versions Tauri already uses.
+  Checked on macOS and for `x86_64-pc-windows-msvc`; the Linux hook has not
+  been built here (GTK does not cross-compile without a sysroot)
 - **`transcode::Summary` carries `frame_rate` and `bit_depth`.** `frame_rate` is
   the exact `Rational` the file was written at (30000/1001 stays that, not
   29.97), and `bit_depth` is bits per sample per component — 8 today, since both

@@ -1,6 +1,6 @@
 [package]
 name = "vtome"
-version = "0.2.7"
+version = "0.3.0"
 edition = "2021"
 authors = ["Jonathan Stoff <JonathanLStoff@gmail.com>"]
 description = "Show images and video on a specific monitor — or a specific quadrilateral of one — with royalty-free codecs and no FFmpeg. GPU presentation with perspective-correct corner pinning, optional windowing, and a frame pipeline that stays in YUV until the shader."
@@ -71,7 +71,30 @@ windows = { version = "0.61", optional = true, features = [
     "Win32_System_Com_StructuredStorage",
     "Win32_System_Ole",
     "Win32_System_Variant",
+    # The `tauri` feature's right-click hook on an output window (a window subclass).
+    "Win32_UI_Shell",
+    "Win32_UI_WindowsAndMessaging",
 ] }
+
+# The `tauri` feature's output windows on macOS: raised above the menu bar, and
+# right-clicks seen through an application-local event monitor. The versions
+# Tauri itself uses, so an application builds one copy.
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = { version = "0.6", optional = true }
+block2 = { version = "0.6", optional = true }
+objc2-app-kit = { version = "0.3", optional = true, default-features = false, features = [
+    "std",
+    "block2",
+    "NSEvent",
+    "NSGraphics",
+    "NSResponder",
+    "NSWindow",
+] }
+
+# The `tauri` feature's right-click hook on Linux: a GTK button-press handler on
+# the output window. Tauri's own GTK.
+[target.'cfg(target_os = "linux")'.dependencies]
+gtk = { version = "0.18", optional = true }
 
 [features]
 default = ["demux", "image"]
@@ -118,8 +141,19 @@ embed = ["render"]
 window = ["render", "dep:winit"]
 # The engine inside a Tauri application, which owns the event loop: vtome opens
 # Tauri windows (bare ones, which is Tauri's `unstable` feature) and draws into
-# them. Pulls in tauri and never winit.
-tauri = ["render", "demux", "image", "dep:tauri"]
+# them. Pulls in tauri and never winit, plus the platform crates the output
+# windows need: right-clicks on all three, the menu-bar level on macOS.
+tauri = [
+    "render",
+    "demux",
+    "image",
+    "dep:tauri",
+    "dep:windows",
+    "dep:objc2",
+    "dep:block2",
+    "dep:objc2-app-kit",
+    "dep:gtk",
+]
 
 # Still images.
 image = ["dep:image"]

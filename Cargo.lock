@@ -5687,13 +5687,17 @@ dependencies = [
 
 [[package]]
 name = "vtome"
-version = "0.2.7"
+version = "0.3.0"
 dependencies = [
  "atome",
+ "block2 0.6.2",
  "bytemuck",
+ "gtk",
  "image",
  "matroska-demuxer",
  "mp4",
+ "objc2 0.6.4",
+ "objc2-app-kit 0.3.2",
  "pfac",
  "pollster",
  "rav1e",

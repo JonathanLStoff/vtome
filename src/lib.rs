@@ -155,6 +155,9 @@ mod standalone;
 #[cfg(feature = "tauri")]
 mod tauri_host;
 
+#[cfg(feature = "tauri")]
+mod tauri_native;
+
 #[cfg(all(feature = "decode-platform", target_vendor = "apple"))]
 pub mod decode_videotoolbox;
 

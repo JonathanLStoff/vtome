@@ -23,6 +23,13 @@ use crate::error::{Error, Result};
 use crate::geometry::Rect;
 use crate::placement::{monitor_id, Monitor};
 use crate::render::Gpu;
+use crate::tauri_native;
+
+/// What a right-click on an output runs: given the output's monitor id and its window.
+type RightClick<R> = Arc<dyn Fn(&str, &tauri::Window<R>) + Send + Sync>;
+
+/// The open outputs' windows, by monitor id.
+type Outputs<R> = Arc<Mutex<Vec<(String, tauri::Window<R>)>>>;
 
 /// Video and images on your monitors, as borderless always-on-top overlays,
 /// in windows a Tauri application opens for vtome.
@@ -57,6 +64,10 @@ pub struct TauriVtome<R: Runtime> {
     excluded: HashSet<String>,
     frame_rate: f64,
     click_through: bool,
+    cover_menu_bar: bool,
+    right_click: Option<RightClick<R>>,
+    /// The open outputs' windows, by monitor id: for hiding and showing them.
+    windows: Outputs<R>,
     controls: Controls,
     commands: Mutex<Option<Receiver<Command>>>,
     shared: Arc<Shared>,
@@ -92,6 +103,9 @@ impl<R: Runtime> TauriVtome<R> {
             excluded: excluded_monitors.into_iter().map(Into::into).collect(),
             frame_rate,
             click_through: true,
+            cover_menu_bar: false,
+            right_click: None,
+            windows: Arc::new(Mutex::new(Vec::new())),
             controls,
             commands: Mutex::new(Some(commands)),
             shared,
@@ -104,6 +118,75 @@ impl<R: Runtime> TauriVtome<R> {
     pub fn click_through(mut self, click_through: bool) -> Self {
         self.click_through = click_through;
         self
+    }
+
+    /// Whether the outputs sit above the menu bar and the Dock on macOS, rather
+    /// than below them as always-on-top windows otherwise do. Off by default;
+    /// nothing changes on other platforms.
+    pub fn cover_menu_bar(mut self, cover: bool) -> Self {
+        self.cover_menu_bar = cover;
+        self
+    }
+
+    /// Calls `on_click` with the monitor id and the window of an output that is
+    /// right-clicked. It runs on the main thread, from inside the platform's
+    /// event handling: to show a menu (`tauri::Window::popup_menu`), queue it
+    /// with `AppHandle::run_on_main_thread` rather than opening it in the call.
+    ///
+    /// The outputs only hear the mouse with [`click_through`](Self::click_through)
+    /// off. Clicks outside an output's rectangle are never its.
+    pub fn on_right_click(mut self, on_click: impl Fn(&str, &tauri::Window<R>) + Send + Sync + 'static) -> Self {
+        self.right_click = Some(Arc::new(on_click));
+        self
+    }
+
+    /// The window of the output on `monitor`, while it is open.
+    pub fn window(&self, monitor: &str) -> Option<tauri::Window<R>> {
+        lock(&self.windows).iter().find(|(id, _)| id == monitor).map(|(_, window)| window.clone())
+    }
+
+    /// Hides the output on `monitor`. Its clips keep playing, unseen; nothing
+    /// shows it again but [`show_all`](Self::show_all) or a new engine. False
+    /// if there is no output there.
+    ///
+    /// # Errors
+    ///
+    /// Whatever Tauri refuses.
+    pub fn hide(&self, monitor: &str) -> Result<bool> {
+        match self.window(monitor) {
+            Some(window) => window.hide().map(|()| true).map_err(|error| Error::Render {
+                reason: format!("Tauri would not hide the output on {monitor}: {error}"),
+            }),
+            None => Ok(false),
+        }
+    }
+
+    /// Hides every output. See [`hide`](Self::hide).
+    ///
+    /// # Errors
+    ///
+    /// The first thing Tauri refuses.
+    pub fn hide_all(&self) -> Result<()> {
+        for (monitor, window) in lock(&self.windows).iter() {
+            window.hide().map_err(|error| Error::Render {
+                reason: format!("Tauri would not hide the output on {monitor}: {error}"),
+            })?;
+        }
+        Ok(())
+    }
+
+    /// Shows every output again.
+    ///
+    /// # Errors
+    ///
+    /// The first thing Tauri refuses.
+    pub fn show_all(&self) -> Result<()> {
+        for (monitor, window) in lock(&self.windows).iter() {
+            window.show().map_err(|error| Error::Render {
+                reason: format!("Tauri would not show the output on {monitor}: {error}"),
+            })?;
+        }
+        Ok(())
     }
 
     /// The monitors attached right now, with the ids `start`, `add`, and the
@@ -332,6 +415,10 @@ impl<R: Runtime> TauriVtome<R> {
     pub fn close(&self) -> Result<()> {
         self.controls.close();
 
+        for (monitor, _) in lock(&self.windows).drain(..) {
+            tauri_native::forget(&label(&monitor));
+        }
+
         let engine = self.engine.lock().unwrap_or_else(PoisonError::into_inner).take();
 
         match engine.map(JoinHandle::join) {
@@ -348,10 +435,15 @@ impl<R: Runtime> TauriVtome<R> {
     /// or doing it directly when this already is the main thread.
     fn open(&self, plans: &[Planned]) -> Result<(Gpu, Vec<Screen<tauri::Window<R>>>)> {
         let app = self.app.clone();
-        let click_through = self.click_through;
+        let options = WindowOptions {
+            click_through: self.click_through,
+            cover_menu_bar: self.cover_menu_bar,
+            right_click: self.right_click.clone(),
+        };
         let plans: Vec<Planned> = plans.to_vec();
+        let windows = Arc::clone(&self.windows);
 
-        let job = move || open_on_main_thread(&app, &plans, click_through);
+        let job = move || open_on_main_thread(&app, &plans, &options, &windows);
 
         if is_main_thread() {
             return job();
@@ -418,16 +510,37 @@ fn is_main_thread() -> bool {
     }
 }
 
-/// Opens every planned window with its surface. Main thread only.
+/// A lock that a panic elsewhere does not make unusable.
+fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// An output window's label: unique per application, and a monitor has one output.
+fn label(monitor: &str) -> String {
+    format!("vtome-{monitor}")
+}
+
+/// How the output windows are made: the engine's settings at `start`.
+struct WindowOptions<R: Runtime> {
+    click_through: bool,
+    cover_menu_bar: bool,
+    right_click: Option<RightClick<R>>,
+}
+
+/// Opens every planned window with its surface, and records the windows in
+/// `opened`. Main thread only.
 fn open_on_main_thread<R: Runtime>(
     app: &AppHandle<R>,
     plans: &[Planned],
-    click_through: bool,
+    options: &WindowOptions<R>,
+    opened: &Mutex<Vec<(String, tauri::Window<R>)>>,
 ) -> Result<(Gpu, Vec<Screen<tauri::Window<R>>>)> {
     let windows = plans
         .iter()
-        .map(|plan| window(app, plan, click_through))
+        .map(|plan| window(app, plan, options))
         .collect::<Result<Vec<_>>>()?;
+
+    *lock(opened) = plans.iter().map(|plan| plan.monitor.clone()).zip(windows.iter().cloned()).collect();
 
     let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_with_display_handle(
         Box::new(windows[0].clone()),
@@ -457,20 +570,20 @@ fn open_on_main_thread<R: Runtime>(
 }
 
 /// One output's window: bare (no webview), borderless, see-through, above
-/// everything, and never taking focus from the application's own windows.
+/// everything (the menu bar too, if asked), and never taking focus from the
+/// application's own windows.
 fn window<R: Runtime>(
     app: &AppHandle<R>,
     plan: &Planned,
-    click_through: bool,
+    options: &WindowOptions<R>,
 ) -> Result<tauri::Window<R>> {
     let tauri_error = |error: tauri::Error| Error::Render {
         reason: format!("Tauri would not open the window for {}: {error}", plan.monitor),
     };
 
-    // Labels are unique per application, and a monitor has one output.
-    let label = format!("vtome-{}", plan.monitor);
+    let label = label(&plan.monitor);
 
-    let builder = tauri::WindowBuilder::new(app, label)
+    let builder = tauri::WindowBuilder::new(app, &label)
         .title(format!("vtome — {}", plan.monitor))
         .decorations(false)
         .resizable(false)
@@ -500,8 +613,17 @@ fn window<R: Runtime>(
     #[cfg(target_os = "macos")]
     see_through(&window)?;
 
-    if click_through {
+    if options.cover_menu_bar {
+        tauri_native::cover_menu_bar(&window)?;
+    }
+
+    if options.click_through {
         window.set_ignore_cursor_events(true).map_err(tauri_error)?;
+    }
+
+    if let Some(on_click) = &options.right_click {
+        let (on_click, monitor, clicked) = (Arc::clone(on_click), plan.monitor.clone(), window.clone());
+        tauri_native::watch_right_clicks(&window, &label, Arc::new(move || on_click(&monitor, &clicked)))?;
     }
 
     window.show().map_err(tauri_error)?;
