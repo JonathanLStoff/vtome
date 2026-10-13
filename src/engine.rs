@@ -176,14 +176,90 @@ pub struct Clip {
     hold: Hold,
     looping: bool,
     start_at: Option<Duration>,
-    audio: Option<PathBuf>,
+    audio: Option<AudioMedia>,
 }
 
 #[derive(Clone, Debug)]
 enum Media {
     Video(PathBuf),
+    VideoReader(ReaderSlot, String),
     Image(PathBuf),
     Frame(Frame),
+}
+
+/// Where a video's separate sound comes from.
+#[derive(Clone, Debug)]
+enum AudioMedia {
+    Path(PathBuf),
+    Reader(ReaderSlot, String),
+}
+
+/// A reader given to a clip, read by the one clip that is added with it: a
+/// clone of the clip shares the slot, and adding it a second time is refused
+/// rather than two clips seeking the same reader under each other.
+#[derive(Clone)]
+pub(crate) struct ReaderSlot(Arc<Mutex<Option<Box<dyn crate::ReadSeek>>>>);
+
+impl ReaderSlot {
+    fn new(reader: impl crate::ReadSeek + 'static) -> Self {
+        ReaderSlot(Arc::new(Mutex::new(Some(Box::new(reader)))))
+    }
+
+    fn take(&self, name: &str) -> Result<Box<dyn crate::ReadSeek>> {
+        lock(&self.0)
+            .take()
+            .ok_or_else(|| Error::unsupported(format!("{name}: this reader was already given to a clip that was added")))
+    }
+}
+
+impl std::fmt::Debug for ReaderSlot {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("ReaderSlot(..)")
+    }
+}
+
+/// A soundtrack's source once its clip is added: a file, or the reader taken
+/// from the clip — shared so a looping film's sound can read it again from
+/// the top, one pass after another.
+#[derive(Clone, Debug)]
+#[cfg_attr(not(feature = "atome"), allow(dead_code))]
+pub(crate) enum SoundSource {
+    Path(PathBuf),
+    Reader(SharedReader, String),
+}
+
+/// One reader, read by whoever holds a clone, one call at a time.
+#[derive(Clone)]
+pub(crate) struct SharedReader(Arc<Mutex<Box<dyn crate::ReadSeek>>>);
+
+impl std::fmt::Debug for SharedReader {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("SharedReader(..)")
+    }
+}
+
+impl std::io::Read for SharedReader {
+    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        lock(&self.0).read(buffer)
+    }
+}
+
+impl std::io::Seek for SharedReader {
+    fn seek(&mut self, position: std::io::SeekFrom) -> std::io::Result<u64> {
+        lock(&self.0).seek(position)
+    }
+}
+
+impl AudioMedia {
+    fn open(self) -> Result<SoundSource> {
+        Ok(match self {
+            AudioMedia::Path(path) => SoundSource::Path(path),
+            AudioMedia::Reader(slot, name) => {
+                let reader = slot.take(&name)?;
+                SoundSource::Reader(SharedReader(Arc::new(Mutex::new(reader))), name)
+            }
+        })
+    }
 }
 
 impl Clip {
@@ -205,6 +281,16 @@ impl Clip {
     /// A video file, played once unless [`looping`](Clip::looping).
     pub fn video(path: impl Into<PathBuf>, monitor: impl Into<String>) -> Self {
         Clip::with(Media::Video(path.into()), monitor)
+    }
+
+    /// A video read from `reader` rather than a file of its own — an entry of
+    /// an archive, bytes in memory. `name` is what errors call it. The reader
+    /// is read by this clip once it is added; adding a clone of the clip as
+    /// well is refused. A film read this way does not play its own sound
+    /// track (it would need reading twice at once): give
+    /// [`audio_reader`](Clip::audio_reader) or [`audio`](Clip::audio).
+    pub fn video_reader(reader: impl crate::ReadSeek + 'static, name: impl Into<String>, monitor: impl Into<String>) -> Self {
+        Clip::with(Media::VideoReader(ReaderSlot::new(reader), name.into()), monitor)
     }
 
     /// An image file, shown until stopped unless given a
@@ -284,7 +370,16 @@ impl Clip {
     /// and this is not used. Heard only with [`Audio::atome`]; stills ignore
     /// it.
     pub fn audio(mut self, path: impl Into<PathBuf>) -> Self {
-        self.audio = Some(path.into());
+        self.audio = Some(AudioMedia::Path(path.into()));
+        self
+    }
+
+    /// [`audio`](Clip::audio) read from `reader` rather than a file. `name`
+    /// is what errors call it. Read by this clip once it is added, as
+    /// [`video_reader`](Clip::video_reader) is; a looping film reads it again
+    /// from the top each pass.
+    pub fn audio_reader(mut self, reader: impl crate::ReadSeek + 'static, name: impl Into<String>) -> Self {
+        self.audio = Some(AudioMedia::Reader(ReaderSlot::new(reader), name.into()));
         self
     }
 }
@@ -311,7 +406,7 @@ pub(crate) struct Prepared {
     /// Where a video's sound comes from: the film itself, or the file it was
     /// given. `None` for a still, or a silent film.
     #[cfg_attr(not(feature = "atome"), allow(dead_code))]
-    soundtrack: Option<PathBuf>,
+    soundtrack: Option<SoundSource>,
     /// How long the film runs, for a looping soundtrack.
     #[cfg_attr(not(feature = "atome"), allow(dead_code))]
     duration: Duration,
@@ -431,7 +526,7 @@ impl Controls {
         ranges: Vec<(u64, u64)>,
         frames: Vec<Frame>,
     ) -> Result<ClipId> {
-        if !matches!(clip.media, Media::Video(_)) {
+        if !matches!(clip.media, Media::Video(_) | Media::VideoReader(..)) {
             return Err(Error::unsupported(
                 "only a video has frames to cache; this clip is a still",
             ));
@@ -465,10 +560,24 @@ impl Controls {
                 // The film's own sound if it has any; otherwise the file
                 // given for it, if one was.
                 soundtrack = if source.info().has_audio() {
-                    Some(path)
+                    Some(SoundSource::Path(path))
                 } else {
-                    clip.audio
+                    clip.audio.map(AudioMedia::open).transpose()?
                 };
+                duration = source.info().duration;
+
+                if let Some(cache) = cache {
+                    source.set_cache(cache)?;
+                }
+
+                Content::Video(source)
+            }
+            Media::VideoReader(slot, name) => {
+                let mut source = VideoSource::from_reader(slot.take(&name)?, &name)?;
+
+                // Only the sound given for it: the film's own would need its
+                // reader twice at once.
+                soundtrack = clip.audio.map(AudioMedia::open).transpose()?;
                 duration = source.info().duration;
 
                 if let Some(cache) = cache {
@@ -1080,14 +1189,14 @@ impl<W> Core<W> {
         let Audio::Atome(scheduler) = &self.audio else {
             return None;
         };
-        let path = prepared.soundtrack.as_ref()?;
+        let source = prepared.soundtrack.as_ref()?;
 
         let at = prepared
             .start_at
             .unwrap_or_else(|| self.compositor.clock().position() + PREROLL);
         let period = (prepared.looping && !prepared.duration.is_zero()).then_some(prepared.duration);
 
-        match crate::audio::Soundtrack::start(path, scheduler.clone(), at, period) {
+        match crate::audio::Soundtrack::start(source, scheduler.clone(), at, period) {
             Ok(soundtrack) => {
                 self.soundtracks.insert(id, soundtrack);
             }

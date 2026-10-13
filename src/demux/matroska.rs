@@ -26,7 +26,7 @@ use super::{color_from, demux_error, scaled, video_track};
 /// One Matroska or WebM file.
 pub(super) struct MatroskaDemuxer {
     path: PathBuf,
-    file: MatroskaFile<BufReader<File>>,
+    file: MatroskaFile<BufReader<Box<dyn crate::ReadSeek>>>,
     info: MediaInfo,
     /// Ticks per second for every timestamp in the file.
     timescale: u64,
@@ -38,8 +38,12 @@ pub(super) struct MatroskaDemuxer {
 impl MatroskaDemuxer {
     pub(super) fn open(path: &Path, container: Container) -> Result<Self> {
         let file = File::open(path).map_err(|error| Error::io(path, error))?;
+        Self::open_reader(Box::new(file), path, container)
+    }
 
-        let file = MatroskaFile::open(BufReader::new(file))
+    /// [`open`](Self::open) on a reader. `path` is only what errors call it.
+    pub(super) fn open_reader(source: Box<dyn crate::ReadSeek>, path: &Path, container: Container) -> Result<Self> {
+        let file = MatroskaFile::open(BufReader::new(source))
             .map_err(|error| demux_error(&path.to_path_buf(), error))?;
 
         // Matroska timestamps are in units of this many nanoseconds — a

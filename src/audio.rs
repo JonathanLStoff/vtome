@@ -13,7 +13,7 @@
 //! stopping the clip cancels the voice, and whatever of it has not reached the
 //! device is taken back — silence within a buffer, not a second later.
 
-use std::path::{Path, PathBuf};
+use std::io::{Seek, SeekFrom};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread::JoinHandle;
@@ -21,6 +21,7 @@ use std::time::Duration;
 
 use atome::output::Scheduler;
 
+use crate::engine::SoundSource;
 use crate::error::{Error, Result};
 
 /// How far ahead of the speakers a soundtrack is scheduled. Enough to ride out
@@ -40,7 +41,7 @@ pub(crate) struct Soundtrack {
 }
 
 impl Soundtrack {
-    /// Starts feeding `path`'s audio so its first sample is heard at `at` on
+    /// Starts feeding `source`'s audio so its first sample is heard at `at` on
     /// the output's clock, starting over every `period` if the film loops.
     ///
     /// # Errors
@@ -48,24 +49,24 @@ impl Soundtrack {
     /// Whatever atome refuses about the file — no audio in it, an encoding it
     /// does not decode — at once, rather than as silence later.
     pub(crate) fn start(
-        path: &Path,
+        source: &SoundSource,
         scheduler: Scheduler<f32>,
         at: Duration,
         period: Option<Duration>,
     ) -> Result<Self> {
         // Opened here, on the caller's thread, so a file atome cannot read is
         // an error now. The feeder opens its own for each pass.
-        open(path)?;
+        open(source)?;
 
         let voice = scheduler.new_voice();
         let stop = Arc::new(AtomicBool::new(false));
 
         let thread = {
-            let (path, scheduler, stop) = (path.to_path_buf(), scheduler.clone(), Arc::clone(&stop));
+            let (source, scheduler, stop) = (source.clone(), scheduler.clone(), Arc::clone(&stop));
 
             std::thread::Builder::new()
                 .name("vtome-soundtrack".to_string())
-                .spawn(move || feed(&path, &scheduler, voice, at, period, &stop))
+                .spawn(move || feed(&source, &scheduler, voice, at, period, &stop))
                 .map_err(|error| Error::unsupported(format!("no thread for a soundtrack: {error}")))?
         };
 
@@ -91,20 +92,31 @@ impl Drop for Soundtrack {
     }
 }
 
-/// Whether atome can play `path`'s audio, and the stream if so.
-fn open(path: &Path) -> Result<Box<dyn atome::import::AudioStream<f32>>> {
-    let encoding = atome::import::find_type(path).map_err(|error| no_audio(path, error))?;
-    atome::import::stream_as::<f32>(path, encoding).map_err(|error| no_audio(path, error))
+/// Whether atome can play `source`'s audio, and the stream if so — from the
+/// top: a reader is wound back first.
+fn open(source: &SoundSource) -> Result<Box<dyn atome::import::AudioStream<f32>>> {
+    match source {
+        SoundSource::Path(path) => {
+            let name = path.display().to_string();
+            let encoding = atome::import::find_type(path).map_err(|error| no_audio(&name, error))?;
+            atome::import::stream_as::<f32>(path, encoding).map_err(|error| no_audio(&name, error))
+        }
+        SoundSource::Reader(reader, name) => {
+            let mut reader = reader.clone();
+            reader.seek(SeekFrom::Start(0)).map_err(|error| no_audio(name, error))?;
+            atome::import::stream_reader::<f32>(Box::new(reader), name).map_err(|error| no_audio(name, error))
+        }
+    }
 }
 
-fn no_audio(path: &Path, error: impl std::fmt::Display) -> Error {
-    Error::unsupported(format!("{}: atome cannot play its audio: {error}", path.display()))
+fn no_audio(name: &str, error: impl std::fmt::Display) -> Error {
+    Error::unsupported(format!("{name}: atome cannot play its audio: {error}"))
 }
 
 /// The feeding loop: decode, fit to the output, schedule, never more than
 /// [`LEAD`] ahead — and again from the top each `period` for a looping film.
 fn feed(
-    path: &PathBuf,
+    source: &SoundSource,
     scheduler: &Scheduler<f32>,
     voice: u64,
     at: Duration,
@@ -122,7 +134,7 @@ fn feed(
         let start = at + period.map_or(Duration::ZERO, |period| period * pass);
         let mut index = index_at(start);
 
-        let Ok(mut stream) = open(path) else {
+        let Ok(mut stream) = open(source) else {
             return;
         };
 
@@ -193,7 +205,7 @@ mod tests {
             return;
         };
 
-        let result = Soundtrack::start(Path::new(SILENT), output.scheduler(), Duration::ZERO, None);
+        let result = Soundtrack::start(&SoundSource::Path(SILENT.into()), output.scheduler(), Duration::ZERO, None);
         assert!(matches!(result, Err(Error::Unsupported { .. })), "the fixture has no audio");
     }
 
@@ -218,7 +230,7 @@ mod tests {
         }
 
         let soundtrack =
-            Soundtrack::start(&path, output.scheduler(), Duration::from_millis(100), None).unwrap();
+            Soundtrack::start(&SoundSource::Path(path.clone()), output.scheduler(), Duration::from_millis(100), None).unwrap();
         std::thread::sleep(Duration::from_millis(50));
 
         // With the stream never built the clock stands at zero, so the feeder

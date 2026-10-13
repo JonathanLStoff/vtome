@@ -42,7 +42,7 @@ struct Cursor {
 /// One MP4, with its sample index.
 pub(super) struct Mp4Demuxer {
     path: PathBuf,
-    reader: ::mp4::Mp4Reader<BufReader<File>>,
+    reader: ::mp4::Mp4Reader<BufReader<Box<dyn crate::ReadSeek>>>,
     info: MediaInfo,
     cursors: Vec<Cursor>,
 }
@@ -50,12 +50,17 @@ pub(super) struct Mp4Demuxer {
 impl Mp4Demuxer {
     pub(super) fn open(path: &Path, container: Container) -> Result<Self> {
         let file = File::open(path).map_err(|error| Error::io(path, error))?;
-        let size = file
-            .metadata()
-            .map_err(|error| Error::io(path, error))?
-            .len();
+        Self::open_reader(Box::new(file), path, container)
+    }
 
-        let reader = ::mp4::Mp4Reader::read_header(BufReader::new(file), size)
+    /// [`open`](Self::open) on a reader. `path` is only what errors call it.
+    pub(super) fn open_reader(mut source: Box<dyn crate::ReadSeek>, path: &Path, container: Container) -> Result<Self> {
+        use std::io::{Seek, SeekFrom};
+
+        let size = source.seek(SeekFrom::End(0)).map_err(|error| Error::io(path, error))?;
+        source.seek(SeekFrom::Start(0)).map_err(|error| Error::io(path, error))?;
+
+        let reader = ::mp4::Mp4Reader::read_header(BufReader::new(source), size)
             .map_err(|error| demux_error(&path.to_path_buf(), error))?;
 
         let mut tracks = Vec::new();

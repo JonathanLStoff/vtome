@@ -71,6 +71,13 @@ pub mod clock;
 pub mod color;
 pub mod decode;
 mod error;
+
+/// A seekable byte source that can move to another thread — a file, a
+/// `Cursor`, an entry of an archive. What media is opened from when it is not
+/// a file of its own: [`open_media_reader`], [`Clip::video_reader`].
+pub trait ReadSeek: std::io::Read + std::io::Seek + Send + Sync {}
+
+impl<T: std::io::Read + std::io::Seek + Send + Sync> ReadSeek for T {}
 pub mod frame;
 pub mod geometry;
 pub mod identify;
@@ -185,7 +192,7 @@ pub use player::Player;
 pub use video_source::{cache_frames, FrameCache, VideoSource};
 
 #[cfg(feature = "demux")]
-pub use demux::{open as open_media, Demuxer};
+pub use demux::{open as open_media, open_reader as open_media_reader, Demuxer};
 
 #[cfg(feature = "image")]
 pub use still::load_image;

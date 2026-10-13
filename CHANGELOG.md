@@ -5,6 +5,18 @@ as it lands (see `.claude/CLAUDE.md` in the sibling crates for the habit).
 
 **Done**
 
+- **0.3.1: video and its sound from a reader, not only a file.**
+  `Clip::video_reader(reader, name, monitor)` and `.audio_reader(reader,
+  name)` take any `vtome::ReadSeek` (`Read + Seek + Send + Sync`: a `Cursor`,
+  an entry of a pfac bundle). Underneath, `vtome::open_media_reader(reader,
+  name)` identifies the container from its first bytes and opens MP4 or
+  Matroska on the reader (both demuxers now read through a boxed `ReadSeek`,
+  a `File` being one), and `VideoSource::from_reader` builds on it. A reader
+  is read by the one clip added with it — adding a clone of that clip is
+  refused rather than two clips seeking one reader. A film read this way does
+  not play its own sound track; its separate sound (`audio_reader`) is wound
+  back to the top for each pass of a looping film. Needs atome 0.8.5
+  (`import::stream_reader`)
 - **0.3.0: `TauriVtome` outputs can be right-clicked, cover the macOS menu
   bar, and be hidden.** `on_right_click(|monitor, window| …)` is called on the
   main thread when an output is right-clicked (it needs `click_through(false)`;

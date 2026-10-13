@@ -94,6 +94,39 @@ pub fn open(path: impl AsRef<Path>) -> Result<Box<dyn Demuxer>> {
     }
 }
 
+/// [`open`] on media that is not a file of its own: any [`ReadSeek`](crate::ReadSeek),
+/// identified from its first bytes as `open` identifies a file. `name` is
+/// only what errors call it.
+///
+/// # Errors
+///
+/// As [`open`].
+pub fn open_reader(mut reader: Box<dyn crate::ReadSeek>, name: &str) -> Result<Box<dyn Demuxer>> {
+    use std::io::{Read, Seek, SeekFrom};
+
+    let path = Path::new(name);
+    let mut probe = Vec::with_capacity(crate::identify::PROBE_BYTES);
+    reader
+        .by_ref()
+        .take(crate::identify::PROBE_BYTES as u64)
+        .read_to_end(&mut probe)
+        .map_err(|error| Error::io(path, error))?;
+    reader.seek(SeekFrom::Start(0)).map_err(|error| Error::io(path, error))?;
+
+    let container = crate::identify::identify_bytes(&probe).ok_or_else(|| Error::UnknownContainer {
+        path: path.to_path_buf(),
+        found: crate::identify::describe_unknown(&probe),
+    })?;
+
+    match container {
+        Container::Mp4 | Container::Avif | Container::Heif => Ok(Box::new(mp4::Mp4Demuxer::open_reader(reader, path, container)?)),
+        Container::Matroska | Container::WebM => Ok(Box::new(matroska::MatroskaDemuxer::open_reader(reader, path, container)?)),
+        _ => Err(Error::unsupported(format!(
+            "{name} is a {container}, which vtome does not open from a reader. Transcode it to WebM or MP4 first"
+        ))),
+    }
+}
+
 /// Turns a container-scale timestamp into a duration.
 ///
 /// Timescales are ticks per second and are commonly 90000 or 1000000000, so

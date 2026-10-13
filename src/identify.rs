@@ -376,7 +376,7 @@ fn read_up_to(mut reader: impl std::io::Read, buffer: &mut [u8]) -> std::io::Res
 
 /// The first few bytes in hex, so an unrecognised file says something useful
 /// rather than only that it was unrecognised.
-fn describe_unknown(bytes: &[u8]) -> String {
+pub(crate) fn describe_unknown(bytes: &[u8]) -> String {
     if bytes.is_empty() {
         return "empty file".to_string();
     }

@@ -84,10 +84,23 @@ impl VideoSource {
     #[cfg(feature = "demux")]
     pub fn from_file<P: AsRef<Path>>(path: P) -> Result<Self> {
         let path = path.as_ref();
+        Self::from_demuxer(crate::open_media(path)?, path)
+    }
 
-        // Open demuxer
-        let demuxer = crate::open_media(path)?;
+    /// [`from_file`](Self::from_file) on media read from `reader` — an entry
+    /// of an archive, bytes in memory. `name` is what errors call it, and
+    /// what the source's id is made from.
+    ///
+    /// # Errors
+    ///
+    /// As [`from_file`](Self::from_file).
+    #[cfg(feature = "demux")]
+    pub fn from_reader(reader: Box<dyn crate::ReadSeek>, name: &str) -> Result<Self> {
+        Self::from_demuxer(crate::open_media_reader(reader, name)?, Path::new(name))
+    }
 
+    #[cfg(feature = "demux")]
+    fn from_demuxer(demuxer: Box<dyn crate::Demuxer>, path: &Path) -> Result<Self> {
         // Find video track
         let media_info = demuxer.info();
         let video_track = media_info
