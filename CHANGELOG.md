@@ -5,6 +5,19 @@ as it lands (see `.claude/CLAUDE.md` in the sibling crates for the habit).
 
 **Done**
 
+- **QuickTime `.mov` files with AAC sound open.** A `.mov` from QuickTime,
+  Final Cut and similar tools describes its audio with a version 1 or 2 sound
+  description (16 or 36 extra bytes, the `esds` wrapped in `wave`). The `mp4`
+  crate only reads the ISO layout and refused the whole file: "mp4a box
+  contains a box with a larger size than it". `demux::quicktime` now rewrites
+  each such entry, in memory, into the ISO layout before the crate parses it:
+  the ISO fields (version 2's real channel count, bit depth and rate taken
+  from its extension), then the `esds`, then a `free` box over the rest. The
+  entry keeps its length, so no box size or sample offset changes, and the
+  file on disk is never touched. No new dependency. `hvc1`-tagged HEVC is
+  still unrecognised by the crate and left as it was. 4 unit tests, plus
+  `tests/quicktime.rs` opening and transcoding a real QuickTime file
+  (`tests/data/aac_quicktime_v1.mov`)
 - **0.3.1: video and its sound from a reader, not only a file.**
   `Clip::video_reader(reader, name, monitor)` and `.audio_reader(reader,
   name)` take any `vtome::ReadSeek` (`Read + Seek + Send + Sync`: a `Cursor`,

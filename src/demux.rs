@@ -35,6 +35,7 @@ use crate::media::{MediaInfo, Packet, Rational, Rotation, TrackInfo, TrackKind};
 
 mod matroska;
 mod mp4;
+mod quicktime;
 
 /// A container that has been opened and can be read through.
 pub trait Demuxer: Send {

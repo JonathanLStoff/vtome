@@ -16,6 +16,7 @@ use crate::error::{Error, Result};
 use crate::identify::Container;
 use crate::media::{MediaInfo, Packet, Rational, Rotation, TrackInfo, TrackKind};
 
+use super::quicktime::Patched;
 use super::{color_from, demux_error, scaled, video_track};
 
 /// Where one track has got to.
@@ -59,6 +60,11 @@ impl Mp4Demuxer {
 
         let size = source.seek(SeekFrom::End(0)).map_err(|error| Error::io(path, error))?;
         source.seek(SeekFrom::Start(0)).map_err(|error| Error::io(path, error))?;
+
+        // QuickTime sound entries are rewritten into the ISO layout the crate
+        // reads first, or a `.mov` with AAC in it fails to open at all.
+        let source: Box<dyn crate::ReadSeek> =
+            Box::new(Patched::new(source, size).map_err(|error| Error::io(path, error))?);
 
         let reader = ::mp4::Mp4Reader::read_header(BufReader::new(source), size)
             .map_err(|error| demux_error(&path.to_path_buf(), error))?;

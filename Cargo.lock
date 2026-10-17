@@ -5687,7 +5687,7 @@ dependencies = [
 
 [[package]]
 name = "vtome"
-version = "0.3.2"
+version = "0.3.3"
 dependencies = [
  "atome",
  "block2 0.6.2",
