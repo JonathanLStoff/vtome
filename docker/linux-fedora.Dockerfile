@@ -16,6 +16,8 @@ RUN dnf install -y \
         libX11-devel libxkbcommon-devel wayland-devel libXcursor-devel libXrandr-devel libXi-devel \
         gtk3-devel webkit2gtk4.1-devel libsoup3-devel javascriptcoregtk4.1-devel \
         alsa-lib-devel \
+        gstreamer1-plugins-base gstreamer1-plugins-good gstreamer1-plugins-bad-free \
+        gstreamer1-plugins-ugly gstreamer1-plugin-libav \
     && dnf clean all
 
 RUN curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain stable

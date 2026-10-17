@@ -7,7 +7,7 @@
 //! cargo test --features split-audio --test import    # and the FLAC split
 //! ```
 
-#![cfg(all(target_vendor = "apple", feature = "transcode"))]
+#![cfg(feature = "transcode")]
 
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -192,7 +192,13 @@ fn hardware_acceleration_is_an_import_option() {
     assert_eq!(done.decoder_hardware, Some(false));
     assert_eq!(done.encoder_hardware, Some(false));
 
-    // AV1 is software, so requiring hardware of it is refused at the call.
+    // AV1 is software, so requiring hardware of it is refused at the call —
+    // by the encoder, or a step sooner by the decoder on a machine with no
+    // hardware H.264 decoder either (a CI runner, which has no GPU).
+    let track = vtome::open_media(FIXTURE).unwrap().info().video().unwrap().clone();
+    let config = vtome::decode::DecoderConfig::from_track(&track).unwrap();
+    let hardware_decodes = vtome::decode::open_with(&config, Hardware::Require).is_ok();
+
     let refused = queue.import(
         FIXTURE,
         directory.path().join("never.webm"),
@@ -203,7 +209,11 @@ fn hardware_acceleration_is_an_import_option() {
             ..ImportOptions::default()
         },
     );
-    assert!(matches!(refused, Err(vtome::Error::NoEncoder { .. })), "{refused:?}");
+    if hardware_decodes {
+        assert!(matches!(refused, Err(vtome::Error::NoEncoder { .. })), "{refused:?}");
+    } else {
+        assert!(matches!(refused, Err(vtome::Error::NoDecoder { .. })), "{refused:?}");
+    }
 }
 
 /// A bad import is an error from the call, not a failed job later.

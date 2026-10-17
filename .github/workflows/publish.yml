@@ -45,11 +45,18 @@ jobs:
       #
       # There is no way around it by turning features off: cpal needs a host
       # backend, and on Linux that is this one.
-      - name: Install ALSA development headers
+      #
+      # GStreamer is the system's H.264 decoder and encoder on Linux, which
+      # vtome opens at run time. The runner has no GPU, so it decodes with
+      # libav's avdec_h264 and encodes with x264enc — installed here, never
+      # bundled — and the transcode and import tests run as they do on a Mac.
+      - name: Install ALSA headers and GStreamer
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          sudo apt-get install --yes --no-install-recommends libasound2-dev pkg-config
+          sudo apt-get install --yes --no-install-recommends libasound2-dev pkg-config \
+            gstreamer1.0-plugins-base gstreamer1.0-plugins-good gstreamer1.0-plugins-bad \
+            gstreamer1.0-plugins-ugly gstreamer1.0-libav
 
       - name: Install the stable toolchain
         run: |

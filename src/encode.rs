@@ -8,7 +8,7 @@
 //!
 //! | Encoding | Backend | Why this one |
 //! |---|---|---|
-//! | H.264 — the default | VideoToolbox (macOS, iOS), Media Foundation (Windows), MediaCodec (Android) | Universal hardware decode, everywhere a file goes. Patent-pooled, so **only ever the OS's encoder** — never x264, never openh264 |
+//! | H.264 — the default | VideoToolbox (macOS, iOS), Media Foundation (Windows), MediaCodec (Android), GStreamer (Linux) | Universal hardware decode, everywhere a file goes. Patent-pooled, so **only ever the OS's encoder**, never one vtome bundles — on Linux, whichever the system's GStreamer has |
 //! | AV1 | `rav1e`, bundled | Royalty-free and pure Rust, so it ships inside every transcode build. Written only when asked for: vtome cannot yet play it back on most machines |
 //!
 //! # What the files look like
@@ -74,6 +74,9 @@ pub enum Backend {
     MediaFoundation,
     /// Google's, on Android: the device's own encoder.
     MediaCodec,
+    /// Linux's: whichever H.264 encoder its GStreamer has — VA-API or NVIDIA
+    /// in hardware, else the system's software encoder.
+    GStreamer,
     /// rav1e, in software, for AV1 anywhere.
     Rav1e,
 }
@@ -87,9 +90,10 @@ impl Backend {
     /// The cargo feature that compiles it in.
     pub fn feature(self) -> &'static str {
         match self {
-            Backend::VideoToolbox | Backend::MediaFoundation | Backend::MediaCodec => {
-                "encode-platform"
-            }
+            Backend::VideoToolbox
+            | Backend::MediaFoundation
+            | Backend::MediaCodec
+            | Backend::GStreamer => "encode-platform",
             Backend::Rav1e => "encode-av1",
         }
     }
@@ -97,9 +101,10 @@ impl Backend {
     /// What it writes for vtome.
     pub fn handles(self, encoding: Encoding) -> bool {
         match self {
-            Backend::VideoToolbox | Backend::MediaFoundation | Backend::MediaCodec => {
-                encoding == Encoding::H264
-            }
+            Backend::VideoToolbox
+            | Backend::MediaFoundation
+            | Backend::MediaCodec
+            | Backend::GStreamer => encoding == Encoding::H264,
             Backend::Rav1e => encoding == Encoding::Av1,
         }
     }
@@ -113,6 +118,12 @@ impl Backend {
             }
             Backend::MediaFoundation => cfg!(all(feature = "encode-platform", windows)),
             Backend::MediaCodec => cfg!(all(feature = "encode-platform", target_os = "android")),
+            Backend::GStreamer => cfg!(all(
+                feature = "encode-platform",
+                unix,
+                not(target_vendor = "apple"),
+                not(target_os = "android")
+            )),
             Backend::Rav1e => cfg!(feature = "encode-av1"),
         }
     }
@@ -123,6 +134,7 @@ impl Backend {
             Backend::VideoToolbox => cfg!(target_vendor = "apple"),
             Backend::MediaFoundation => cfg!(windows),
             Backend::MediaCodec => cfg!(target_os = "android"),
+            Backend::GStreamer => cfg!(all(unix, not(target_vendor = "apple"), not(target_os = "android"))),
             Backend::Rav1e => true,
         }
     }
@@ -134,16 +146,18 @@ impl std::fmt::Display for Backend {
             Backend::VideoToolbox => "VideoToolbox",
             Backend::MediaFoundation => "Media Foundation",
             Backend::MediaCodec => "MediaCodec",
+            Backend::GStreamer => "GStreamer",
             Backend::Rav1e => "rav1e",
         })
     }
 }
 
 /// Every backend, in the order [`open`] tries them.
-pub const BACKENDS: [Backend; 4] = [
+pub const BACKENDS: [Backend; 5] = [
     Backend::VideoToolbox,
     Backend::MediaFoundation,
     Backend::MediaCodec,
+    Backend::GStreamer,
     Backend::Rav1e,
 ];
 
@@ -397,6 +411,17 @@ fn instantiate(backend: Backend, config: &EncoderConfig) -> Option<Result<Box<dy
         #[cfg(all(feature = "encode-platform", target_os = "android"))]
         Backend::MediaCodec => Some(
             crate::media_codec::MediaCodecEncoder::new(config)
+                .map(|encoder| Box::new(encoder) as Box<dyn Encoder>),
+        ),
+
+        #[cfg(all(
+            feature = "encode-platform",
+            unix,
+            not(target_vendor = "apple"),
+            not(target_os = "android")
+        ))]
+        Backend::GStreamer => Some(
+            crate::gstreamer::GStreamerEncoder::new(config)
                 .map(|encoder| Box::new(encoder) as Box<dyn Encoder>),
         ),
 

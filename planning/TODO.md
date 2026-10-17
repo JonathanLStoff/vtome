@@ -23,15 +23,16 @@ clock, H.264 decoding and encoding through the OS (VideoToolbox; Media
 Foundation and MediaCodec compiled and type-checked, not yet run on those
 systems), AV1 encoding through rav1e, the import queue, and the `Vtome` engine
 in both its versions — soundtracks through atome included — are built and
-tested. What is *not* built: H.264 on Linux (VA-API), AV1 *decoding* (§2), and
-the zero-copy paths. So vtome today imports to H.264 and puts stills and H.264
+tested; on Linux, H.264 goes through the system's GStreamer (2026-10-17). What
+is *not* built: AV1 *decoding* (§2), and the zero-copy paths. So vtome today imports to H.264 and puts stills and H.264
 video, with their sound, in any convex quadrilateral on any monitor.
 
 **No bundled H.264 or AAC codec, anywhere** (asked for 2026-10-03): every H.264
 or AAC encoder and decoder vtome and atome use is the operating system's.
 Symphonia's AAC decoder and libfdk-aac are out of atome; `cargo tree -i` finds
-no AAC or H.264 codec crate in either graph. Linux, which has no OS codec for
-either, refuses both by name.
+no AAC or H.264 codec crate in either graph. On Linux, H.264 is GStreamer's —
+the system's own plugins, opened at run time (2026-10-17); AAC there is still
+refused by name.
 
 ---
 
@@ -183,8 +184,12 @@ build actually have.
       name
       - [ ] Zero-copy: decode to a `SurfaceTexture` and sample it as an
             external texture
-- [ ] **Linux** — VA-API (`cros-libva`) with a V4L2-M2M path for ARM boards, and
-      a documented "software only" outcome where neither exists
+- [x] **Linux** — H.264 through the system's GStreamer (`gstreamer.rs`,
+      2026-10-17), opened with `dlopen` and declared by hand, so no crate. It
+      reaches VA-API, NVIDIA and V4L2 in hardware, and the distribution's
+      software codecs otherwise. See CHANGELOG
+      - [ ] Zero-copy: VA-API surfaces as DMA-BUFs into wgpu, which needs
+            GStreamer's memory types rather than mapped system memory
 - [ ] **Portable software AV1** — dav1d via `dav1d-rs`, or `rav1d` if its
       release state holds up. This is the floor: it is what makes "vtome can
       always play what vtome wrote" true on every target. Until then
@@ -432,10 +437,11 @@ Multi-source, multi-layer rendering like OBS.
 
 ## 11. Decisions still open
 
-- [ ] **H.264 input on Linux.** VA-API where the driver has it; otherwise
-      `openh264` built from source, whose patent position is not Cisco's binary
-      licence. Write the conclusion down in the README rather than leaving it
-      implied
+- [x] **H.264 input on Linux** (decided 2026-10-17): the system's GStreamer,
+      in both directions, never a bundled codec and never a new crate. The
+      codec is whichever the machine's owner installed — VA-API where the
+      driver has it, otherwise the distribution's software plugins. Written
+      down in the README
 - [ ] **`rav1d` vs `dav1d-rs`.** The Rust port removes the C toolchain from every
       build, which is worth real effort — but only if its releases and its
       performance are there. Benchmark both before committing

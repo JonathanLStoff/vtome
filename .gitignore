@@ -22,3 +22,6 @@ target
 
 # Local patch to the sibling atome checkout while its PlayClock is unreleased.
 /.cargo/config.toml
+
+# macOS Finder metadata
+.DS_Store

@@ -12,6 +12,8 @@
 #     real pixels with no GPU in the container
 #   - winit's X11/Wayland headers, and GTK and WebKitGTK for the `tauri`
 #     feature — Tauri 2 needs them on Linux even with no webview in use
+#   - GStreamer with libav and x264, the system H.264 decoder and encoder
+#     vtome opens at run time
 #
 # The source is mounted read-only at /src and copied, so fixtures made here
 # never land in the working tree.
@@ -28,6 +30,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         libx11-dev libxkbcommon-dev libwayland-dev libxcursor-dev libxrandr-dev libxi-dev \
         libgtk-3-dev libwebkit2gtk-4.1-dev libsoup-3.0-dev libjavascriptcoregtk-4.1-dev \
         libasound2-dev \
+        gstreamer1.0-plugins-base gstreamer1.0-plugins-good gstreamer1.0-plugins-bad \
+        gstreamer1.0-plugins-ugly gstreamer1.0-libav \
     && rm -rf /var/lib/apt/lists/*
 
 RUN curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain stable

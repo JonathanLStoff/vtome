@@ -14,7 +14,7 @@
 //! cargo test --features transcode --test transcode
 //! ```
 
-#![cfg(all(target_vendor = "apple", feature = "transcode"))]
+#![cfg(feature = "transcode")]
 
 use std::io::{Cursor, Read, Seek, SeekFrom};
 use std::path::Path;

@@ -3,7 +3,7 @@
 //! One trait, several backends, and a runtime choice between them. The choice
 //! is the interesting part: which decoder exists depends on the platform *and*
 //! on what was compiled in, and the two fail differently. A build without
-//! `decode-av1` and a Linux box without VA-API both produce "no decoder", and a
+//! `decode-av1` and a Linux box without GStreamer both produce "no decoder", and a
 //! person needs to know which one they are looking at — so [`open`] says.
 //!
 //! # Where the decoders come from
@@ -16,7 +16,7 @@
 //! | VideoToolbox | macOS, iOS | H.264, and AV1 on hardware that has it |
 //! | Media Foundation | Windows | H.264, AV1 |
 //! | MediaCodec | Android | H.264, and AV1 where the device ships it |
-//! | VA-API | Linux | whatever the driver exposes |
+//! | GStreamer | Linux | H.264: VA-API or NVIDIA in hardware, else the system's software decoder |
 //! | dav1d | anywhere | AV1, in software |
 //!
 //! The platform decoders come first: they are hardware-accelerated, and the
@@ -26,8 +26,8 @@
 //!
 //! # What is implemented
 //!
-//! H.264 through VideoToolbox (Apple targets), Media Foundation (Windows), and
-//! MediaCodec (Android), each with `decode-platform`. For everything else [`open`] refuses
+//! H.264 through VideoToolbox (Apple targets), Media Foundation (Windows),
+//! MediaCodec (Android), and GStreamer (Linux), each with `decode-platform`. For everything else [`open`] refuses
 //! honestly, naming the backend that would have taken the work, rather than
 //! returning a decoder that produces nothing. See `planning/TODO.md` §2.
 
@@ -98,8 +98,11 @@ pub enum Backend {
     MediaFoundation,
     /// Google's, on Android.
     MediaCodec,
-    /// The Linux hardware path.
+    /// VA-API on its own. Not opened directly: on Linux, VA-API is reached
+    /// through [`GStreamer`](Backend::GStreamer)'s `va` plugin.
     VaApi,
+    /// Linux's: whichever H.264 decoder its GStreamer has, hardware first.
+    GStreamer,
     /// dav1d, in software, for AV1 anywhere.
     Dav1d,
 }
@@ -116,7 +119,8 @@ impl Backend {
             Backend::VideoToolbox
             | Backend::MediaFoundation
             | Backend::MediaCodec
-            | Backend::VaApi => "decode-platform",
+            | Backend::VaApi
+            | Backend::GStreamer => "decode-platform",
             Backend::Dav1d => "decode-av1",
         }
     }
@@ -131,6 +135,7 @@ impl Backend {
             | Backend::MediaFoundation
             | Backend::MediaCodec
             | Backend::VaApi => matches!(encoding, Encoding::H264 | Encoding::Av1),
+            Backend::GStreamer => encoding == Encoding::H264,
             Backend::Dav1d => encoding == Encoding::Av1,
         }
     }
@@ -152,7 +157,8 @@ impl Backend {
             Backend::VideoToolbox => cfg!(target_vendor = "apple"),
             Backend::MediaFoundation => cfg!(windows),
             Backend::MediaCodec => cfg!(target_os = "android"),
-            Backend::VaApi => cfg!(all(
+            Backend::VaApi => false,
+            Backend::GStreamer => cfg!(all(
                 unix,
                 not(target_vendor = "apple"),
                 not(target_os = "android")
@@ -169,6 +175,7 @@ impl std::fmt::Display for Backend {
             Backend::MediaFoundation => "Media Foundation",
             Backend::MediaCodec => "MediaCodec",
             Backend::VaApi => "VA-API",
+            Backend::GStreamer => "GStreamer",
             Backend::Dav1d => "dav1d",
         };
 
@@ -184,7 +191,7 @@ pub const BACKENDS: [Backend; 5] = [
     Backend::VideoToolbox,
     Backend::MediaFoundation,
     Backend::MediaCodec,
-    Backend::VaApi,
+    Backend::GStreamer,
     Backend::Dav1d,
 ];
 
@@ -341,6 +348,17 @@ fn instantiate(
                 .map(|decoder| Box::new(decoder) as Box<dyn Decoder>),
         ),
 
+        #[cfg(all(
+            feature = "decode-platform",
+            unix,
+            not(target_vendor = "apple"),
+            not(target_os = "android")
+        ))]
+        Backend::GStreamer => Some(
+            crate::gstreamer::GStreamerDecoder::new(config, hardware)
+                .map(|decoder| Box::new(decoder) as Box<dyn Decoder>),
+        ),
+
         #[cfg(feature = "decode-av1")]
         Backend::Dav1d => Some(
             crate::decode_av1::Av1Decoder::new()
@@ -450,7 +468,7 @@ mod tests {
             Backend::VideoToolbox,
             Backend::MediaFoundation,
             Backend::MediaCodec,
-            Backend::VaApi,
+            Backend::GStreamer,
         ]
         .into_iter()
         .filter(|backend| backend.exists_here())

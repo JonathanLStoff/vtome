@@ -105,6 +105,15 @@ pub mod media_foundation;
 #[cfg(all(target_os = "android", any(feature = "decode-platform", feature = "encode-platform")))]
 pub mod media_codec;
 
+// Linux's — whatever its GStreamer has — loaded at run time.
+#[cfg(all(
+    unix,
+    not(target_vendor = "apple"),
+    not(target_os = "android"),
+    any(feature = "decode-platform", feature = "encode-platform")
+))]
+pub mod gstreamer;
+
 #[cfg(feature = "demux")]
 mod playback;
 

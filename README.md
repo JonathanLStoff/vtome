@@ -56,7 +56,7 @@ operating system ships and already licensed:
 | macOS, iOS | VideoToolbox |
 | Windows | Media Foundation |
 | Android | MediaCodec |
-| Linux | none yet (VA-API is planned) — refused by name, never bundled |
+| Linux | GStreamer, opened at run time: VA-API or NVIDIA in hardware, else the system's own software codecs (e.g. `avdec_h264`, `x264enc`). Without GStreamer, refused by name with the packages to install |
 
 The same rule holds for the audio half: AAC is decoded by
 [`atome`](../atome) through AudioToolbox, Media Foundation, or MediaCodec — never

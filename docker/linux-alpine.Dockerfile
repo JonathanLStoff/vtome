@@ -9,7 +9,8 @@ RUN apk add --no-cache \
         mesa-vulkan-swrast vulkan-loader mesa-egl \
         libx11-dev libxkbcommon-dev wayland-dev libxcursor-dev libxrandr-dev libxi-dev \
         gtk+3.0-dev webkit2gtk-4.1-dev libsoup3-dev \
-        alsa-lib-dev
+        alsa-lib-dev \
+        gst-plugins-base gst-plugins-good gst-plugins-bad gst-plugins-ugly gst-libav
 
 RUN curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain stable
 

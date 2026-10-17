@@ -5,6 +5,27 @@ as it lands (see `.claude/CLAUDE.md` in the sibling crates for the habit).
 
 **Done**
 
+- **H.264 on Linux, through the system's GStreamer.** `gstreamer.rs` adds
+  `decode::Backend::GStreamer` and `encode::Backend::GStreamer`, both under
+  the existing `decode-platform` / `encode-platform` features and compiled only
+  on Linux and other non-Apple, non-Android Unix. GStreamer is opened with
+  `dlopen` at run time and its calls are declared by hand, so vtome adds no
+  crate and builds on a machine without GStreamer. A machine without it gets
+  `NoDecoder` / `NoEncoder` naming the packages to install. Hardware first —
+  `vah264dec`/`vah264enc`, the older `vaapi` elements, NVIDIA, V4L2 — then
+  software: `avdec_h264` or `openh264dec` to read, `x264enc` or `openh264enc`
+  to write, all narrowed by `Hardware`. A hardware decoder that refuses the
+  stream before its first picture hands it to the next one from the start.
+  The encoder follows §15: High profile, Level 4.1, no B-frames, a keyframe
+  exactly every interval with SPS/PPS before each. x264 is given a constant
+  quality, mapped as rav1e's quantizer is, rather than a bitrate that starves
+  small pictures. `Backend::VaApi` stays but is no longer tried on its own.
+  `tests/transcode.rs`, `tests/import.rs` and the QuickTime transcode test now
+  run on every OS, not only Apple. CI and the Debian, Fedora and Alpine images
+  install GStreamer. The hardware test accepts `NoDecoder` where the machine
+  has no hardware decoder (a CI runner has no GPU). The whole suite passes on
+  macOS and on Ubuntu 24.04 with GStreamer installed. Windows and Android
+  type-check. 5 unit tests
 - **QuickTime `.mov` files with AAC sound open.** A `.mov` from QuickTime,
   Final Cut and similar tools describes its audio with a version 1 or 2 sound
   description (16 or 36 extra bytes, the `esds` wrapped in `wave`). The `mp4`
