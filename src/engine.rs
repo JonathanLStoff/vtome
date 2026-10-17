@@ -788,8 +788,11 @@ impl Controls {
 #[derive(Clone)]
 pub(crate) struct Planned {
     pub(crate) monitor: String,
-    /// In desktop physical pixels.
+    /// In desktop physical pixels. Unread on a phone, where no output window
+    /// is placed.
+    #[cfg_attr(any(target_os = "ios", target_os = "android"), allow(dead_code))]
     pub(crate) x: i32,
+    #[cfg_attr(any(target_os = "ios", target_os = "android"), allow(dead_code))]
     pub(crate) y: i32,
     pub(crate) width: u32,
     pub(crate) height: u32,

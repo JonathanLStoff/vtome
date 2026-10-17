@@ -14,7 +14,9 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-use tauri::{AppHandle, PhysicalPosition, PhysicalSize, Runtime};
+use tauri::{AppHandle, Runtime};
+#[cfg(not(any(target_os = "ios", target_os = "android")))]
+use tauri::{PhysicalPosition, PhysicalSize};
 
 use crate::engine::{
     self, Audio, Clip, ClipId, Command, Controls, Core, Hold, OutputRect, Planned, Screen, Shared,
@@ -521,6 +523,8 @@ fn label(monitor: &str) -> String {
 }
 
 /// How the output windows are made: the engine's settings at `start`.
+// Unread on a phone, where no output window is made.
+#[cfg_attr(any(target_os = "ios", target_os = "android"), allow(dead_code))]
 struct WindowOptions<R: Runtime> {
     click_through: bool,
     cover_menu_bar: bool,
@@ -572,6 +576,7 @@ fn open_on_main_thread<R: Runtime>(
 /// One output's window: bare (no webview), borderless, see-through, above
 /// everything (the menu bar too, if asked), and never taking focus from the
 /// application's own windows.
+#[cfg(not(any(target_os = "ios", target_os = "android")))]
 fn window<R: Runtime>(
     app: &AppHandle<R>,
     plan: &Planned,
@@ -629,6 +634,23 @@ fn window<R: Runtime>(
     window.show().map_err(tauri_error)?;
 
     Ok(window)
+}
+
+/// On a phone there is one window, and it is the application's: Tauri has no
+/// borderless, always-on-top window there to put on a monitor. A second
+/// screen on iOS or Android — AirPlay, a `Presentation` display — is nothing
+/// like a desktop monitor list, and is not built yet (planning/TODO.md §11).
+#[cfg(any(target_os = "ios", target_os = "android"))]
+fn window<R: Runtime>(
+    _app: &AppHandle<R>,
+    plan: &Planned,
+    _options: &WindowOptions<R>,
+) -> Result<tauri::Window<R>> {
+    Err(Error::unsupported(format!(
+        "vtome's output windows are desktop only, so nothing can be opened on {} on iOS or \
+         Android; external displays there are not built yet (planning/TODO.md §11)",
+        plan.monitor
+    )))
 }
 
 /// `window.opaque = NO; window.backgroundColor = NSColor.clearColor` — what a

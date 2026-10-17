@@ -1,6 +1,6 @@
 [package]
 name = "vtome"
-version = "0.3.4"
+version = "0.3.5"
 edition = "2021"
 authors = ["Jonathan Stoff <JonathanLStoff@gmail.com>"]
 description = "Show images and video on a specific monitor — or a specific quadrilateral of one — with royalty-free codecs and no FFmpeg. GPU presentation with perspective-correct corner pinning, optional windowing, and a frame pipeline that stays in YUV until the shader."
@@ -37,7 +37,6 @@ wgpu = { version = "30", optional = true }
 bytemuck = { version = "1", optional = true, features = ["derive"] }
 pollster = { version = "0.4", optional = true }
 raw-window-handle = { version = "0.6", optional = true }
-winit = { version = "0.30", optional = true }
 # The `tauri` feature's host. Bare windows — no webview — are behind Tauri's
 # `unstable` feature. Default features are off so vtome never chooses a runtime:
 # the application's own tauri dependency brings wry.
@@ -91,6 +90,14 @@ objc2-app-kit = { version = "0.3", optional = true, default-features = false, fe
     "NSWindow",
 ] }
 
+# The `window` feature's windows: desktop only. On iOS and Android the app's
+# own entry point owns the one window there is — Tauri's, or the app's — and
+# winit there needs an `android-activity` backend chosen by the application,
+# which conflicts with Tauri's. So `window` compiles to nothing on a phone
+# rather than failing to build, whatever features the application turns on.
+[target.'cfg(not(any(target_os = "ios", target_os = "android")))'.dependencies]
+winit = { version = "0.30", optional = true }
+
 # The `tauri` feature's right-click hook on Linux: a GTK button-press handler on
 # the output window. Tauri's own GTK.
 [target.'cfg(target_os = "linux")'.dependencies]
@@ -138,6 +145,9 @@ split-audio = ["transcode", "atome", "atome/export"]
 # Presentation.
 render = ["dep:wgpu", "dep:bytemuck", "dep:pollster", "dep:raw-window-handle"]
 embed = ["render"]
+# vtome's own windows, through winit. Desktop only: on iOS and Android this
+# feature is accepted and builds nothing, so one feature list serves an app's
+# every target.
 window = ["render", "dep:winit"]
 # The engine inside a Tauri application, which owns the event loop: vtome opens
 # Tauri windows (bare ones, which is Tauri's `unstable` feature) and draws into

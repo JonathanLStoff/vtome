@@ -5,6 +5,9 @@
 //!
 //! Everything here runs on the main thread, where the windows were made.
 
+// On a phone no output window is ever made, so only `forget` is reached.
+#![cfg_attr(any(target_os = "ios", target_os = "android"), allow(dead_code))]
+
 use std::sync::Arc;
 
 use tauri::Runtime;

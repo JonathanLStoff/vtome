@@ -889,7 +889,7 @@ fn read_back(
 /// Video carries its own transfer curve, and an sRGB target would apply a
 /// second one on the way out.
 // Only the engine's windows ask; a render-only build draws offscreen.
-#[cfg_attr(not(any(feature = "window", feature = "tauri")), allow(dead_code))]
+#[cfg_attr(not(any(all(feature = "window", not(any(target_os = "ios", target_os = "android"))), feature = "tauri")), allow(dead_code))]
 pub(crate) fn surface_format(capabilities: &wgpu::SurfaceCapabilities) -> wgpu::TextureFormat {
     capabilities
         .formats
@@ -907,7 +907,7 @@ pub(crate) fn surface_format(capabilities: &wgpu::SurfaceCapabilities) -> wgpu::
 /// clear, and differs only at partial opacity. Opaque is the last resort, and
 /// on it everything around a corner-pinned quad is black.
 // Only the engine's windows ask; a render-only build draws offscreen.
-#[cfg_attr(not(any(feature = "window", feature = "tauri")), allow(dead_code))]
+#[cfg_attr(not(any(all(feature = "window", not(any(target_os = "ios", target_os = "android"))), feature = "tauri")), allow(dead_code))]
 pub(crate) fn see_through(capabilities: &wgpu::SurfaceCapabilities) -> wgpu::CompositeAlphaMode {
     use wgpu::CompositeAlphaMode::{Inherit, PostMultiplied, PreMultiplied};
 

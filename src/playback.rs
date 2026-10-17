@@ -92,7 +92,7 @@ impl Playback {
     /// The picture's size as stored, known before anything decodes. Not as
     /// rotated: the renderer draws the planes as they are.
     // Only `Viewer` reports on a single film.
-    #[cfg_attr(not(feature = "window"), allow(dead_code))]
+    #[cfg_attr(not(all(feature = "window", not(any(target_os = "ios", target_os = "android")))), allow(dead_code))]
     pub(crate) fn size(&self) -> (u32, u32) {
         self.source
             .info()
@@ -102,14 +102,14 @@ impl Playback {
 
     /// Presented, dropped, and repeated, as [`Pacing`] counts them.
     // Only `Viewer` reports on a single film.
-    #[cfg_attr(not(feature = "window"), allow(dead_code))]
+    #[cfg_attr(not(all(feature = "window", not(any(target_os = "ios", target_os = "android")))), allow(dead_code))]
     pub(crate) fn counts(&self) -> (u64, u64, u64) {
         self.pacing.counts()
     }
 
     /// How many times the film has started again from the top.
     // Only `Viewer` reports on a single film.
-    #[cfg_attr(not(feature = "window"), allow(dead_code))]
+    #[cfg_attr(not(all(feature = "window", not(any(target_os = "ios", target_os = "android")))), allow(dead_code))]
     pub(crate) fn loops(&self) -> u32 {
         self.loops
     }
@@ -207,7 +207,7 @@ impl Playback {
     }
 
     // Only `Viewer` reports on a single film.
-    #[cfg_attr(not(feature = "window"), allow(dead_code))]
+    #[cfg_attr(not(all(feature = "window", not(any(target_os = "ios", target_os = "android")))), allow(dead_code))]
     pub(crate) fn toggle_pause(&mut self) {
         if !self.started {
             return;

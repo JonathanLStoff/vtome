@@ -178,8 +178,8 @@ vtome = { version = "0.2", default-features = false, features = ["demux"] }
 | `atome` | Video on atome's clock, and soundtracks through atome | |
 | `split-audio` | `import`'s audio split to FLAC, through atome | |
 | `render` | wgpu. A GPU and a surface — *not* a window | |
-| `window` | `render` + winit: vtome opens its own windows | |
-| `tauri` | The engine inside a Tauri application | |
+| `window` | `render` + winit: vtome opens its own windows. Desktop only: on iOS and Android it builds nothing, so one feature list serves every target | |
+| `tauri` | The engine inside a Tauri application. Builds on iOS and Android too, where `start` refuses to open output windows (desktop overlays only) | |
 | `embed` | `render` against a surface someone else owns | |
 | `decode-av1` | AV1 in software (refuses until dav1d is wired up) | |
 

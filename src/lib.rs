@@ -42,7 +42,7 @@
 //! | `demux` | MP4 and Matroska/WebM parsing (pure Rust) |
 //! | `image` | Still images |
 //! | `render` | GPU presentation via wgpu — a surface, not a window |
-//! | `window` | `render` plus winit, so vtome opens its own windows |
+//! | `window` | `render` plus winit, so vtome opens its own windows. Desktop only: builds nothing on iOS and Android |
 //! | `embed` | `render` against a surface someone else owns — the Tauri path |
 //! | `decode-*` | One decoder backend each |
 //! | `encode-platform`, `encode-av1`, `mux` | H.264 through the OS into MP4, AV1 through rav1e into WebM |
@@ -147,11 +147,13 @@ pub mod still;
 #[cfg(feature = "render")]
 pub mod render;
 
-#[cfg(feature = "window")]
+// vtome's own windows. Desktop only: a phone has one window, and it is the
+// application's (see the `window` feature in Cargo.toml).
+#[cfg(all(feature = "window", not(any(target_os = "ios", target_os = "android"))))]
 pub mod window;
 
 // A clip's soundtrack through atome, on the clock its pictures follow.
-#[cfg(all(feature = "atome", feature = "render", feature = "demux", feature = "image", any(feature = "window", feature = "tauri")))]
+#[cfg(all(feature = "atome", feature = "render", feature = "demux", feature = "image", any(all(feature = "window", not(any(target_os = "ios", target_os = "android"))), feature = "tauri")))]
 mod audio;
 
 // The engine an application drives: outputs per monitor, clips added and
@@ -161,11 +163,11 @@ mod audio;
     feature = "render",
     feature = "demux",
     feature = "image",
-    any(feature = "window", feature = "tauri")
+    any(all(feature = "window", not(any(target_os = "ios", target_os = "android"))), feature = "tauri")
 ))]
 mod engine;
 
-#[cfg(all(feature = "window", feature = "demux", feature = "image"))]
+#[cfg(all(feature = "window", not(any(target_os = "ios", target_os = "android")), feature = "demux", feature = "image"))]
 mod standalone;
 
 #[cfg(feature = "tauri")]
@@ -216,11 +218,11 @@ pub use import::{
     feature = "render",
     feature = "demux",
     feature = "image",
-    any(feature = "window", feature = "tauri")
+    any(all(feature = "window", not(any(target_os = "ios", target_os = "android"))), feature = "tauri")
 ))]
 pub use engine::{Audio, Clip, ClipEnded, ClipId, Controls, Hold, OutputRect};
 
-#[cfg(all(feature = "window", feature = "demux", feature = "image"))]
+#[cfg(all(feature = "window", not(any(target_os = "ios", target_os = "android")), feature = "demux", feature = "image"))]
 pub use standalone::Vtome;
 
 #[cfg(feature = "tauri")]

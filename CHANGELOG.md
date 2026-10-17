@@ -5,6 +5,20 @@ as it lands (see `.claude/CLAUDE.md` in the sibling crates for the habit).
 
 **Done**
 
+- **Builds for iOS and Android.** An app that turns on `window` and `tauri`
+  for its desktop builds, as OrbitX does, now compiles for phones with the
+  same feature list. `winit` is a desktop-only dependency, so `window` builds
+  nothing on iOS and Android. It no longer pulls in `android-activity`, which
+  collided with Tauri's Android entry point ("must enable game-activity or
+  native-activity"). Its code (`window`, `standalone::Vtome`) is gated the
+  same way. In `TauriVtome`, the output-window builder uses Tauri's
+  desktop-only calls (`decorations`, `always_on_top`, `skip_taskbar`,
+  `shadow`), so on a phone it is replaced by a refusal: `start` returns
+  `Unsupported` naming §11 (external displays on iOS and Android) instead of
+  failing the build. Checked with `cargo check` for aarch64-apple-ios,
+  aarch64-apple-ios-sim, aarch64-linux-android and x86_64-linux-android, with
+  no warnings; `cargo tree` finds no winit there. The macOS suite passes, and
+  Windows and Linux type-check
 - **H.264 on Linux, through the system's GStreamer.** `gstreamer.rs` adds
   `decode::Backend::GStreamer` and `encode::Backend::GStreamer`, both under
   the existing `decode-platform` / `encode-platform` features and compiled only
