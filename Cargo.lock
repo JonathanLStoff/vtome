@@ -222,6 +222,8 @@ dependencies = [
 [[package]]
 name = "atome"
 version = "0.8.8"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2d21bb35b72cf1e5170b428f9f20a5a653c459e8b5b33cc3ffd51011ed9b732b"
 dependencies = [
  "atomic-queue",
  "cpal",
