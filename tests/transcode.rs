@@ -234,6 +234,25 @@ fn av1_goes_into_a_webm_that_reads_back() {
     }
 }
 
+/// A picture smaller than the hardware encoder will take must still be written, in software.
+///
+/// The fixture is 128×96, and a vendor's hardware encoder has its own smallest picture — NVENC
+/// wants 145×49 — which it only refuses once the output type is set, long after the MFT has been
+/// found and activated. `Hardware::Prefer` means software where hardware will not do, so the whole
+/// attempt is what falls back, not just the search.
+#[test]
+fn a_picture_under_the_hardware_encoders_floor_falls_back_to_software() {
+    let directory = tempfile::TempDir::new().unwrap();
+    let output = directory.path().join("small.mp4");
+
+    let summary = transcode(FIXTURE, &output, &Settings::default(), |_| {}, &AtomicBool::new(false))
+        .expect("a picture too small for the hardware encoder is written in software");
+
+    assert_eq!((summary.width, summary.height), (128, 96));
+    assert_eq!(summary.frames, FRAMES);
+    assert_eq!(decode_all(&output).len() as u64, FRAMES, "and it reads back whole");
+}
+
 #[test]
 fn hardware_can_be_ruled_out_end_to_end() {
     let directory = tempfile::TempDir::new().unwrap();

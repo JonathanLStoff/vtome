@@ -38,7 +38,7 @@ use windows::Win32::System::Com::{CoInitializeEx, CoTaskMemFree, COINIT_MULTITHR
 use windows::Win32::System::Variant::VARIANT;
 
 use crate::bitstream::{length_prefixed_to_annex_b, AccessUnit, AvcConfig};
-use crate::color::{ColorSpace, Range};
+use crate::color::{ColorSpace, Matrix, Primaries, Range, Transfer};
 use crate::decode::{Decoder, DecoderConfig, Hardware};
 use crate::encode::{Backend, Encoder, EncoderConfig};
 use crate::error::{Error, Result};
@@ -96,6 +96,16 @@ fn decode_failed(doing: &str, error: windows::core::Error) -> Error {
     }
 }
 
+/// Which kinds of MFT to try, in order: hardware first where it is allowed, software as the
+/// fallback. Microsoft's software MFT is part of Windows, so the fallback needs nothing installed.
+fn passes_for(hardware: Hardware) -> &'static [bool] {
+    match hardware {
+        Hardware::Prefer => &[true, false],
+        Hardware::Require => &[true],
+        Hardware::Off => &[false],
+    }
+}
+
 /// An MFT, synchronous or asynchronous, behind one interface.
 struct Transform {
     mft: IMFTransform,
@@ -115,13 +125,20 @@ impl Transform {
     /// `hardware` allows: hardware tried first under `Prefer`, only under
     /// `Require`, never under `Off`.
     fn find(category: GUID, input: GUID, output: GUID, hardware: Hardware) -> Result<Self> {
-        ensure_started()?;
+        Self::find_among(category, input, output, passes_for(hardware), hardware)
+    }
 
-        let passes: &[bool] = match hardware {
-            Hardware::Prefer => &[true, false],
-            Hardware::Require => &[true],
-            Hardware::Off => &[false],
-        };
+    /// As [`Transform::find`], over an explicit list of passes. The encoder walks the passes
+    /// itself, a whole attempt at a time, because an MFT that activates may still refuse the
+    /// configuration that follows; `hardware` here only words the error.
+    fn find_among(
+        category: GUID,
+        input: GUID,
+        output: GUID,
+        passes: &[bool],
+        hardware: Hardware,
+    ) -> Result<Self> {
+        ensure_started()?;
 
         let input = MFT_REGISTER_TYPE_INFO {
             guidMajorType: MFMediaType_Video,
@@ -415,6 +432,126 @@ fn bytes_of(sample: &IMFSample) -> windows::core::Result<(Vec<u8>, Duration)> {
     }
 }
 
+/// Tags `media_type` with what the samples mean, so the encoder writes it into the SPS's VUI and
+/// a decoder applies the right matrix instead of guessing by size. The same mapping as
+/// `encode_videotoolbox::color_properties`, in Media Foundation's names.
+///
+/// # Safety
+///
+/// `media_type` must be a live media type that is still being configured.
+unsafe fn describe_color(media_type: &IMFMediaType, color: ColorSpace) -> windows::core::Result<()> {
+    let primaries = match color.primaries {
+        Primaries::Bt709 => MFVideoPrimaries_BT709,
+        // The 625- and 525-line sets, as EBU and SMPTE wrote them down.
+        Primaries::Bt601_625 => MFVideoPrimaries_EBU3213,
+        Primaries::Bt601_525 => MFVideoPrimaries_SMPTE_C,
+        Primaries::Bt2020 => MFVideoPrimaries_BT2020,
+        // `Primaries` is `non_exhaustive`: anything newer is better left unstated than guessed.
+        _ => MFVideoPrimaries_Unknown,
+    };
+
+    let matrix = match color.matrix {
+        Matrix::Bt709 => Some(MFVideoTransferMatrix_BT709),
+        Matrix::Bt601 => Some(MFVideoTransferMatrix_BT601),
+        Matrix::Bt2020Ncl => Some(MFVideoTransferMatrix_BT2020_10),
+        // Identity is not a YCbCr matrix at all, so nothing is claimed.
+        _ => None,
+    };
+
+    let transfer = match color.transfer {
+        Transfer::Bt709 => Some(MFVideoTransFunc_709),
+        Transfer::Srgb => Some(MFVideoTransFunc_sRGB),
+        // §15 is SDR: the HDR curves are left unstated rather than declared on a stream that was
+        // never tone-mapped for them (as VideoToolbox does).
+        _ => None,
+    };
+
+    let range = if color.range == Range::Full {
+        MFNominalRange_0_255
+    } else {
+        MFNominalRange_16_235
+    };
+
+    // SAFETY: the caller's live media type; every value is a plain enumeration.
+    unsafe {
+        media_type.SetUINT32(&MF_MT_VIDEO_PRIMARIES, primaries.0 as u32)?;
+        media_type.SetUINT32(&MF_MT_VIDEO_NOMINAL_RANGE, range.0 as u32)?;
+        if let Some(matrix) = matrix {
+            media_type.SetUINT32(&MF_MT_YUV_MATRIX, matrix.0 as u32)?;
+        }
+        if let Some(transfer) = transfer {
+            media_type.SetUINT32(&MF_MT_TRANSFER_FUNCTION, transfer.0 as u32)?;
+        }
+    }
+
+    Ok(())
+}
+
+/// Asks the encoder to write `color` into the stream's VUI. The media-type attributes
+/// [`describe_color`] sets say what the samples mean; these say to put it in the bitstream, which
+/// is the only thing Microsoft's software MFT acts on. Each is best-effort: an MFT that declines
+/// one still honours the media type.
+///
+/// # Safety
+///
+/// `api` must be a live `ICodecAPI` on an MFT whose output type is not yet set.
+unsafe fn ask_for_color_in_vui(api: &ICodecAPI, color: ColorSpace) {
+    let primaries = match color.primaries {
+        Primaries::Bt709 => Some(eAVEncVideoColorPrimaries_BT709),
+        Primaries::Bt601_625 => Some(eAVEncVideoColorPrimaries_EBU3231),
+        Primaries::Bt601_525 => Some(eAVEncVideoColorPrimaries_SMPTE_C),
+        // There is no BT.2020 among these: the media type still carries it.
+        _ => None,
+    };
+
+    let matrix = match color.matrix {
+        Matrix::Bt709 => Some(eAVEncVideoColorTransferMatrix_BT709),
+        Matrix::Bt601 => Some(eAVEncVideoColorTransferMatrix_BT601),
+        // Likewise no BT.2020, and Identity is not a YCbCr matrix at all.
+        _ => None,
+    };
+
+    // §15 is SDR, so only the two SDR curves are named; the HDR ones are left unstated.
+    let transfer = match color.transfer {
+        Transfer::Bt709 => Some(eAVEncVideoColorTransferFunction_22_709),
+        Transfer::Srgb => Some(eAVEncVideoColorTransferFunction_22_8bit_sRGB),
+        _ => None,
+    };
+
+    let range = if color.range == Range::Full {
+        eAVEncVideoColorNominalRange_0_255
+    } else {
+        eAVEncVideoColorNominalRange_16_235
+    };
+
+    // SAFETY: the caller's live codec API; every value is a plain enumeration.
+    unsafe {
+        if let Some(primaries) = primaries {
+            let _ = api.SetValue(&CODECAPI_AVEncVideoOutputColorPrimaries, &VARIANT::from(primaries.0 as u32));
+        }
+        if let Some(matrix) = matrix {
+            let _ = api.SetValue(&CODECAPI_AVEncVideoOutputColorTransferMatrix, &VARIANT::from(matrix.0 as u32));
+        }
+        if let Some(transfer) = transfer {
+            let _ = api.SetValue(&CODECAPI_AVEncVideoOutputColorTransferFunction, &VARIANT::from(transfer.0 as u32));
+        }
+        let _ = api.SetValue(&CODECAPI_AVEncVideoOutputColorNominalRange, &VARIANT::from(range.0 as u32));
+    }
+}
+
+/// When a sample is to be decoded, as the MFT marked it. `None` where it did not mark one: an
+/// encoder that emits no B-frames leaves it off, and then decode order is presentation order.
+fn decode_time_of(sample: &IMFSample) -> Option<Duration> {
+    // SAFETY: a live sample; an attribute that is not set comes back as an error, not a crash.
+    unsafe { sample.GetUINT64(&MFSampleExtension_DecodeTimestamp) }
+        .ok()
+        // MF keeps the timestamp in a UINT64 but means a LONGLONG by it, and the first sample of
+        // a reordered stream is decoded before time zero: read the bits back as signed, which
+        // `from_ticks` then floors at zero. Taking it as unsigned would turn that one sample into
+        // an enormous timestamp and put the whole stream out of order.
+        .map(|ticks| from_ticks(ticks as i64))
+}
+
 fn pack(high: u32, low: u32) -> u64 {
     (u64::from(high) << 32) | u64::from(low)
 }
@@ -445,17 +582,53 @@ impl MediaFoundationEncoder {
             });
         }
 
-        let transform = Transform::find(
-            MFT_CATEGORY_VIDEO_ENCODER,
-            MFVideoFormat_NV12,
-            MFVideoFormat_H264,
-            config.hardware,
-        )
-        .map_err(|error| Error::NoEncoder {
-            encoding: Encoding::H264,
-            remedy: error.to_string(),
-        })?;
+        // An MFT can activate and then refuse the configuration: a vendor's hardware encoder has
+        // its own smallest picture — NVENC will not take one narrower than 145 or shorter than 49
+        // — and says so only at `SetOutputType`. Under `Prefer` that is exactly what Windows's own
+        // software MFT is the fallback for, so each pass is tried whole, found and configured and
+        // started, before the next one is.
+        let mut refusal = None;
 
+        for &in_hardware in passes_for(config.hardware) {
+            let found = Transform::find_among(
+                MFT_CATEGORY_VIDEO_ENCODER,
+                MFVideoFormat_NV12,
+                MFVideoFormat_H264,
+                &[in_hardware],
+                config.hardware,
+            )
+            .map_err(|error| Error::NoEncoder {
+                encoding: Encoding::H264,
+                remedy: error.to_string(),
+            });
+
+            let transform = match found {
+                Ok(transform) => transform,
+                Err(error) => {
+                    refusal = Some(error);
+                    continue;
+                }
+            };
+
+            match Self::configured(transform, config) {
+                Ok(encoder) => return Ok(encoder),
+                Err(error) => refusal = Some(error),
+            }
+        }
+
+        Err(refusal.unwrap_or_else(|| Error::NoEncoder {
+            encoding: Encoding::H264,
+            remedy: "Media Foundation has no H.264 encoder here".to_string(),
+        }))
+    }
+
+    /// `transform` set to §15's spec for `config` and started, ready for pictures.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Encode`] for whatever the MFT will not take — the size and rate among it, which
+    /// is where a hardware encoder turns down a picture below its smallest.
+    fn configured(transform: Transform, config: &EncoderConfig) -> Result<Self> {
         let rate = config.frame_rate;
         let size = pack(config.width, config.height);
         let frame_rate = pack(rate.numerator, rate.denominator.max(1));
@@ -463,6 +636,30 @@ impl MediaFoundationEncoder {
         // SAFETY: fresh media types configured before they are handed to a
         // live MFT; the ICodecAPI values are plain integers and booleans.
         unsafe {
+            // Before the output type, not after: Microsoft's software MFT reads its B-frame count
+            // and rate control when the output type is set and ignores a later word on either,
+            // where a hardware MFT takes them whenever they come. Asked too late, the software
+            // encoder wrote B-frames into a stream §15 says has none.
+            if let Some(api) = transform.codec_api() {
+                // Each is the spec's; an encoder that declines one still
+                // honours the type above, so a refusal is not fatal.
+                let _ = api.SetValue(&CODECAPI_AVEncMPVGOPSize, &VARIANT::from(config.keyframe_frames()));
+                let _ = api.SetValue(&CODECAPI_AVEncMPVDefaultBPictureCount, &VARIANT::from(0_u32));
+                let _ = api.SetValue(&CODECAPI_AVEncH264CABACEnable, &VARIANT::from(true));
+                let _ = api.SetValue(
+                    &CODECAPI_AVEncCommonRateControlMode,
+                    &VARIANT::from(eAVEncCommonRateControlMode_Quality.0 as u32),
+                );
+                let _ = api.SetValue(
+                    &CODECAPI_AVEncCommonQuality,
+                    &VARIANT::from((config.quality.clamp(0.0, 1.0) * 100.0).round() as u32),
+                );
+                if config.realtime {
+                    let _ = api.SetValue(&CODECAPI_AVLowLatencyMode, &VARIANT::from(true));
+                }
+                ask_for_color_in_vui(&api, config.color);
+            }
+
             let output = MFCreateMediaType().map_err(|e| failed("making a type", e))?;
             output.SetGUID(&MF_MT_MAJOR_TYPE, &MFMediaType_Video).map_err(|e| failed("the type", e))?;
             output.SetGUID(&MF_MT_SUBTYPE, &MFVideoFormat_H264).map_err(|e| failed("the type", e))?;
@@ -482,6 +679,7 @@ impl MediaFoundationEncoder {
                     .SetUINT32(&MF_MT_MPEG2_LEVEL, eAVEncH264VLevel4_1.0 as u32)
                     .map_err(|e| failed("Level 4.1", e))?;
             }
+            describe_color(&output, config.color).map_err(|e| failed("the colour", e))?;
             transform.mft.SetOutputType(0, &output, 0).map_err(|e| failed("the output type", e))?;
 
             let input = MFCreateMediaType().map_err(|e| failed("making a type", e))?;
@@ -492,26 +690,8 @@ impl MediaFoundationEncoder {
             input
                 .SetUINT32(&MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive.0 as u32)
                 .map_err(|e| failed("progressive", e))?;
+            describe_color(&input, config.color).map_err(|e| failed("the colour", e))?;
             transform.mft.SetInputType(0, &input, 0).map_err(|e| failed("the input type", e))?;
-
-            if let Some(api) = transform.codec_api() {
-                // Each is the spec's; an encoder that declines one still
-                // honours the type above, so a refusal is not fatal.
-                let _ = api.SetValue(&CODECAPI_AVEncMPVGOPSize, &VARIANT::from(config.keyframe_frames()));
-                let _ = api.SetValue(&CODECAPI_AVEncMPVDefaultBPictureCount, &VARIANT::from(0_u32));
-                let _ = api.SetValue(&CODECAPI_AVEncH264CABACEnable, &VARIANT::from(true));
-                let _ = api.SetValue(
-                    &CODECAPI_AVEncCommonRateControlMode,
-                    &VARIANT::from(eAVEncCommonRateControlMode_Quality.0 as u32),
-                );
-                let _ = api.SetValue(
-                    &CODECAPI_AVEncCommonQuality,
-                    &VARIANT::from((config.quality.clamp(0.0, 1.0) * 100.0).round() as u32),
-                );
-                if config.realtime {
-                    let _ = api.SetValue(&CODECAPI_AVLowLatencyMode, &VARIANT::from(true));
-                }
-            }
         }
 
         transform.begin().map_err(|e| failed("starting", e))?;
@@ -532,6 +712,11 @@ impl MediaFoundationEncoder {
             .iter()
             .map(|sample| {
                 let (bytes, pts) = bytes_of(sample).map_err(|e| failed("reading a packet", e))?;
+                // B-frames come out of the encoder after the picture they are shown before, so
+                // what the muxer needs is the MFT's decode timestamp, not the presentation one.
+                // Microsoft's software MFT writes B-frames whatever `AVEncMPVDefaultBPictureCount`
+                // asks of it, so taking `pts` for both put its packets out of order.
+                let dts = decode_time_of(sample).unwrap_or(pts);
                 let unit = AccessUnit::split(&bytes);
 
                 if self.record.is_none() {
@@ -544,7 +729,7 @@ impl MediaFoundationEncoder {
                     track_id: 1,
                     data: unit.data,
                     pts,
-                    dts: pts,
+                    dts,
                     is_keyframe: unit.is_keyframe,
                 })
             })
