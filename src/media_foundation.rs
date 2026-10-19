@@ -446,8 +446,8 @@ unsafe fn describe_color(media_type: &IMFMediaType, color: ColorSpace) -> window
         Primaries::Bt601_625 => MFVideoPrimaries_EBU3213,
         Primaries::Bt601_525 => MFVideoPrimaries_SMPTE_C,
         Primaries::Bt2020 => MFVideoPrimaries_BT2020,
-        // `Primaries` is `non_exhaustive`: anything newer is better left unstated than guessed.
-        _ => MFVideoPrimaries_Unknown,
+        // Every variant named: `non_exhaustive` binds other crates, not this one, so a set added
+        // later stops this compiling rather than being quietly written as `Unknown`.
     };
 
     let matrix = match color.matrix {
