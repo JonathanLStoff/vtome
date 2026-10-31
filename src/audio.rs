@@ -19,6 +19,7 @@ use std::sync::Arc;
 use std::thread::JoinHandle;
 use std::time::Duration;
 
+use atome::import::AudioStream;
 use atome::output::Scheduler;
 
 use crate::engine::SoundSource;
@@ -42,7 +43,9 @@ pub(crate) struct Soundtrack {
 
 impl Soundtrack {
     /// Starts feeding `source`'s audio so its first sample is heard at `at` on
-    /// the output's clock, starting over every `period` if the film loops.
+    /// the output's clock: from `start` in the file up to `end` (`None`: its
+    /// end), and with `looping` round and round with no gap — the pictures'
+    /// section, so the two turn together.
     ///
     /// # Errors
     ///
@@ -52,11 +55,14 @@ impl Soundtrack {
         source: &SoundSource,
         scheduler: Scheduler<f32>,
         at: Duration,
-        period: Option<Duration>,
+        start: Duration,
+        end: Option<Duration>,
+        looping: bool,
     ) -> Result<Self> {
-        // Opened here, on the caller's thread, so a file atome cannot read is
-        // an error now. The feeder opens its own for each pass.
-        open(source)?;
+        // Opened here, on the caller's thread, so a file atome cannot read (or
+        // cannot seek in, for a section) is an error now. The feeder opens its
+        // own.
+        section(source, start, end, looping)?;
 
         let voice = scheduler.new_voice();
         let stop = Arc::new(AtomicBool::new(false));
@@ -66,7 +72,7 @@ impl Soundtrack {
 
             std::thread::Builder::new()
                 .name("vtome-soundtrack".to_string())
-                .spawn(move || feed(&source, &scheduler, voice, at, period, &stop))
+                .spawn(move || feed(&source, &scheduler, voice, at, start, end, looping, &stop))
                 .map_err(|error| Error::unsupported(format!("no thread for a soundtrack: {error}")))?
         };
 
@@ -109,18 +115,34 @@ fn open(source: &SoundSource) -> Result<Box<dyn atome::import::AudioStream<f32>>
     }
 }
 
+/// `source`'s audio from `start` to `end`, looping or not, as frames of its
+/// own rate.
+fn section(source: &SoundSource, start: Duration, end: Option<Duration>, looping: bool) -> Result<atome::import::Section<f32>> {
+    let stream = open(source)?;
+    let rate = f64::from(stream.sample_rate());
+    let frames = |time: Duration| (time.as_secs_f64() * rate).round() as u64;
+    let name = match source {
+        SoundSource::Path(path) => path.display().to_string(),
+        SoundSource::Reader(_, name) => name.clone(),
+    };
+    atome::import::Section::new(stream, frames(start), end.map(frames), looping).map_err(|error| no_audio(&name, error))
+}
+
 fn no_audio(name: &str, error: impl std::fmt::Display) -> Error {
     Error::unsupported(format!("{name}: atome cannot play its audio: {error}"))
 }
 
 /// The feeding loop: decode, fit to the output, schedule, never more than
-/// [`LEAD`] ahead — and again from the top each `period` for a looping film.
+/// [`LEAD`] ahead. A looping section never runs out: it is fed until stopped.
+#[allow(clippy::too_many_arguments)]
 fn feed(
     source: &SoundSource,
     scheduler: &Scheduler<f32>,
     voice: u64,
     at: Duration,
-    period: Option<Duration>,
+    start: Duration,
+    end: Option<Duration>,
+    looping: bool,
     stop: &AtomicBool,
 ) {
     let channels = usize::from(scheduler.channels().max(1));
@@ -128,58 +150,47 @@ fn feed(
     let index_at = |time: Duration| (time.as_secs_f64() * rate).round() as usize * channels;
     let lead = index_at(LEAD);
 
-    let mut pass = 0_u32;
+    let mut index = index_at(at);
+    let Ok(mut stream) = section(source, start, end, looping) else {
+        return;
+    };
+
+    let source_channels = usize::from(stream.channels().max(1));
+    let source_rate = stream.sample_rate();
+    let mut block = vec![0.0_f32; BLOCK_FRAMES * source_channels];
 
     loop {
-        let start = at + period.map_or(Duration::ZERO, |period| period * pass);
-        let mut index = index_at(start);
-
-        let Ok(mut stream) = open(source) else {
+        if stop.load(Ordering::Relaxed) {
             return;
+        }
+
+        // Held back until the speakers are within `LEAD` of it.
+        let playing = scheduler.clock().frames() as usize * channels;
+        if index > playing + lead {
+            std::thread::sleep(Duration::from_millis(10));
+            continue;
+        }
+
+        let read = match stream.read(&mut block) {
+            Ok(0) | Err(_) => return,
+            Ok(read) => read - read % source_channels,
         };
 
-        let source_channels = usize::from(stream.channels().max(1));
-        let source_rate = stream.sample_rate();
-        let mut block = vec![0.0_f32; BLOCK_FRAMES * source_channels];
+        let samples = scheduler.align(&block[..read], source_rate, stream.channels());
 
+        // A full command queue means the mixer is behind; wait for it rather
+        // than drop audio.
         loop {
             if stop.load(Ordering::Relaxed) {
                 return;
             }
-
-            // Held back until the speakers are within `LEAD` of it.
-            let playing = scheduler.clock().frames() as usize * channels;
-            if index > playing + lead {
-                std::thread::sleep(Duration::from_millis(10));
-                continue;
-            }
-
-            let read = match stream.read(&mut block) {
-                Ok(0) | Err(_) => break,
-                Ok(read) => read - read % source_channels,
-            };
-
-            let samples = scheduler.align(&block[..read], source_rate, stream.channels());
-
-            // A full command queue means the mixer is behind; wait for it
-            // rather than drop audio.
-            loop {
-                if stop.load(Ordering::Relaxed) {
-                    return;
+            match scheduler.schedule(&samples, index, Some(voice)) {
+                Ok(next) => {
+                    index = next;
+                    break;
                 }
-                match scheduler.schedule(&samples, index, Some(voice)) {
-                    Ok(next) => {
-                        index = next;
-                        break;
-                    }
-                    Err(_) => std::thread::sleep(Duration::from_millis(2)),
-                }
+                Err(_) => std::thread::sleep(Duration::from_millis(2)),
             }
-        }
-
-        match period {
-            Some(period) if !period.is_zero() => pass += 1,
-            _ => return,
         }
     }
 }
@@ -205,7 +216,7 @@ mod tests {
             return;
         };
 
-        let result = Soundtrack::start(&SoundSource::Path(SILENT.into()), output.scheduler(), Duration::ZERO, None);
+        let result = Soundtrack::start(&SoundSource::Path(SILENT.into()), output.scheduler(), Duration::ZERO, Duration::ZERO, None, false);
         assert!(matches!(result, Err(Error::Unsupported { .. })), "the fixture has no audio");
     }
 
@@ -230,7 +241,7 @@ mod tests {
         }
 
         let soundtrack =
-            Soundtrack::start(&SoundSource::Path(path.clone()), output.scheduler(), Duration::from_millis(100), None).unwrap();
+            Soundtrack::start(&SoundSource::Path(path.clone()), output.scheduler(), Duration::from_millis(100), Duration::ZERO, None, false).unwrap();
         std::thread::sleep(Duration::from_millis(50));
 
         // With the stream never built the clock stands at zero, so the feeder

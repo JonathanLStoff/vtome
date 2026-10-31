@@ -176,6 +176,8 @@ pub struct Clip {
     hold: Hold,
     looping: bool,
     start_at: Option<Duration>,
+    in_point: Duration,
+    out_point: Option<Duration>,
     audio: Option<AudioMedia>,
 }
 
@@ -274,6 +276,8 @@ impl Clip {
             hold: Hold::Forever,
             looping: false,
             start_at: None,
+            in_point: Duration::ZERO,
+            out_point: None,
             audio: None,
         }
     }
@@ -346,8 +350,27 @@ impl Clip {
 
     /// Whether a video starts again when it ends. Off by default: a video
     /// plays once and then its clip is finished.
+    ///
+    /// Seamless: the end runs straight into the start (or the
+    /// [out point](Clip::out_point) into the [in point](Clip::in_point))
+    /// with no picture held and no break in its sound.
     pub fn looping(mut self, looping: bool) -> Self {
         self.looping = looping;
+        self
+    }
+
+    /// Where in the video it starts: this far after its first picture, sound
+    /// and all. A trim; the start of the film by default. Stills ignore it.
+    pub fn in_point(mut self, position: Duration) -> Self {
+        self.in_point = position;
+        self
+    }
+
+    /// Where in the video it stops (or, [looping](Clip::looping), goes back
+    /// to the [in point](Clip::in_point)): this far after its first picture,
+    /// sound and all. The end of the film by default. Stills ignore it.
+    pub fn out_point(mut self, position: Duration) -> Self {
+        self.out_point = Some(position);
         self
     }
 
@@ -403,13 +426,14 @@ pub(crate) struct Prepared {
     z_index: i32,
     looping: bool,
     start_at: Option<Duration>,
+    /// The part of the film played, from its first picture, as the source
+    /// was set to it: its sound plays the same part.
+    #[cfg_attr(not(feature = "atome"), allow(dead_code))]
+    section: (Duration, Option<Duration>),
     /// Where a video's sound comes from: the film itself, or the file it was
     /// given. `None` for a still, or a silent film.
     #[cfg_attr(not(feature = "atome"), allow(dead_code))]
     soundtrack: Option<SoundSource>,
-    /// How long the film runs, for a looping soundtrack.
-    #[cfg_attr(not(feature = "atome"), allow(dead_code))]
-    duration: Duration,
 }
 
 enum Content {
@@ -551,7 +575,20 @@ impl Controls {
         }
 
         let mut soundtrack = None;
-        let mut duration = Duration::ZERO;
+        let mut section = (Duration::ZERO, None);
+        // In and out points, and a loop: the pictures and the sound play the
+        // same part. A loop with no out point turns at the film's length, so
+        // both turn at the same moment.
+        let mut cut = |source: &mut VideoSource| -> Result<()> {
+            let length = source.info().duration;
+            let out = clip.out_point.or_else(|| (clip.looping && !length.is_zero()).then_some(length));
+            if clip.in_point.is_zero() && out.is_none() {
+                return Ok(());
+            }
+            source.set_section(clip.in_point, out, clip.looping)?;
+            section = (clip.in_point, out);
+            Ok(())
+        };
 
         let content = match clip.media {
             Media::Video(path) => {
@@ -564,11 +601,11 @@ impl Controls {
                 } else {
                     clip.audio.map(AudioMedia::open).transpose()?
                 };
-                duration = source.info().duration;
 
                 if let Some(cache) = cache {
                     source.set_cache(cache)?;
                 }
+                cut(&mut source)?;
 
                 Content::Video(source)
             }
@@ -578,11 +615,11 @@ impl Controls {
                 // Only the sound given for it: the film's own would need its
                 // reader twice at once.
                 soundtrack = clip.audio.map(AudioMedia::open).transpose()?;
-                duration = source.info().duration;
 
                 if let Some(cache) = cache {
                     source.set_cache(cache)?;
                 }
+                cut(&mut source)?;
 
                 Content::Video(source)
             }
@@ -608,8 +645,8 @@ impl Controls {
             z_index: clip.z_index,
             looping: clip.looping,
             start_at: clip.start_at,
+            section,
             soundtrack,
-            duration,
         };
 
         self.commands
@@ -1197,9 +1234,9 @@ impl<W> Core<W> {
         let at = prepared
             .start_at
             .unwrap_or_else(|| self.compositor.clock().position() + PREROLL);
-        let period = (prepared.looping && !prepared.duration.is_zero()).then_some(prepared.duration);
+        let (start, end) = prepared.section;
 
-        match crate::audio::Soundtrack::start(source, scheduler.clone(), at, period) {
+        match crate::audio::Soundtrack::start(source, scheduler.clone(), at, start, end, prepared.looping) {
             Ok(soundtrack) => {
                 self.soundtracks.insert(id, soundtrack);
             }

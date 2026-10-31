@@ -327,6 +327,70 @@ fn a_seek_lands_on_the_exact_frame() {
     assert_eq!(bar_centre(&after[0]), bar_centre(&all[10]));
 }
 
+/// Within a microsecond: a file's timescale and `frame * n` round apart.
+fn near(a: Duration, b: Duration) -> bool {
+    a.abs_diff(b) < Duration::from_micros(1)
+}
+
+/// In and out points: frames 5 up to 15 and nothing else, in order.
+#[test]
+fn a_section_plays_from_its_in_point_to_its_out_point() {
+    let mut source = VideoSource::from_file(FIXTURE).unwrap();
+    let all = drain(&mut source);
+    let frame = source.frame_duration().expect("24 fps");
+
+    source.set_section(frame * 5, Some(frame * 15), false).unwrap();
+    let section = drain(&mut source);
+
+    assert_eq!(section.len(), 10);
+    let bars: Vec<u32> = section.iter().map(|each| bar_centre(each).round() as u32).collect();
+    let expected: Vec<u32> = all[5..15].iter().map(|each| bar_centre(each).round() as u32).collect();
+    assert_eq!(bars, expected);
+}
+
+/// A wrapping section never finishes: each pass's pictures follow the last
+/// pass's one frame apart, so a clock running on never sees the seam.
+#[test]
+fn a_wrapping_section_runs_on_with_no_break_in_time() {
+    let mut source = VideoSource::from_file(FIXTURE).unwrap();
+    let all = drain(&mut source);
+    let frame = source.frame_duration().expect("24 fps");
+    let origin = source.origin().unwrap();
+
+    source.set_section(frame * 4, Some(frame * 10), true).unwrap();
+    let mut shown = Vec::new();
+    while shown.len() < 6 * 3 + 2 {
+        source.advance(Duration::ZERO).unwrap();
+        assert!(!source.is_finished(), "a wrapping section never ends");
+        while let Some(each) = source.pop_frame() {
+            shown.push(each);
+        }
+    }
+
+    for (at, each) in shown.iter().enumerate() {
+        assert!(near(each.pts(), origin + frame * (4 + at as u32)), "picture {at} is one frame after the one before: {:?}", each.pts());
+        assert_eq!(bar_centre(each).round(), bar_centre(&all[4 + at % 6]).round(), "picture {at} is frame {}", 4 + at % 6);
+    }
+}
+
+/// A wrap with no out point turns at the end of the film.
+#[test]
+fn a_wrapping_film_turns_at_its_end() {
+    let mut source = VideoSource::from_file(FIXTURE).unwrap();
+    let frame = source.frame_duration().expect("24 fps");
+    let origin = source.origin().unwrap();
+
+    source.set_section(Duration::ZERO, None, true).unwrap();
+    let mut shown = Vec::new();
+    while shown.len() < FRAMES + 3 {
+        source.advance(Duration::ZERO).unwrap();
+        while let Some(each) = source.pop_frame() {
+            shown.push(each.pts());
+        }
+    }
+    assert!(near(shown[FRAMES], origin + frame * FRAMES as u32), "the second pass starts one frame after the first ends: {:?}", shown[FRAMES]);
+}
+
 /// Cached ranges come from memory and the rest from the decoder, and the
 /// film plays through the joins without a frame missing, repeated, or out of
 /// place.

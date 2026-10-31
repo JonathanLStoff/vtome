@@ -62,6 +62,22 @@ pub struct VideoSource {
 
     /// Frames to serve from memory, with where the source is in them.
     cache: Option<Cached>,
+
+    /// The part of the film played, from its first picture: `section_start`
+    /// up to `section_end` (`None`: its end). The whole film by default.
+    section_start: Duration,
+    section_end: Option<Duration>,
+    /// At the end of the section, decode straight on into its start again
+    /// rather than finish (`set_section`).
+    wraps: bool,
+    /// What the passes so far add to every picture's timestamp, so a film
+    /// that wraps runs on in time with no break for the clock to notice.
+    pass_offset: Duration,
+    /// Decoding reached the out point: the rest of this pass is not shown.
+    at_out: bool,
+    /// The last picture queued, as stamped in the file: where a section with
+    /// no out point ends.
+    last_raw: Option<Duration>,
 }
 
 /// A [`FrameCache`] in use.
@@ -141,6 +157,12 @@ impl VideoSource {
             discard_before: None,
             origin: None,
             cache: None,
+            section_start: Duration::ZERO,
+            section_end: None,
+            wraps: false,
+            pass_offset: Duration::ZERO,
+            at_out: false,
+            last_raw: None,
         })
     }
 
@@ -196,6 +218,63 @@ impl VideoSource {
         self.rewind()
     }
 
+    /// Plays only `start` up to `end` of the film (`None`: to its end), both
+    /// counted from its first picture — in and out points — and moves there.
+    ///
+    /// With `wraps`, the end of the section runs straight on into its start:
+    /// the decoder goes back while the queue still holds the last pictures,
+    /// and the next pass's pictures are stamped on from where the last left
+    /// off, so the film never finishes and nothing waits on a keyframe at the
+    /// seam. The source then never [finishes](Self::is_finished). A source
+    /// with a [cache](Self::set_cache) does not wrap: it finishes each pass,
+    /// and [`rewind`](Self::rewind) takes it back to `start`.
+    ///
+    /// # Errors
+    ///
+    /// An `end` not after `start`, and whatever seeking refuses.
+    pub fn set_section(&mut self, start: Duration, end: Option<Duration>, wraps: bool) -> Result<()> {
+        if end.is_some_and(|end| end <= start) {
+            return Err(Error::unsupported(format!("a section must end after it starts, not at {end:?} from {start:?}")));
+        }
+        let origin = self.origin()?;
+        self.section_start = start;
+        self.section_end = end;
+        self.wraps = wraps && self.cache.is_none();
+        self.pass_offset = Duration::ZERO;
+        self.at_out = false;
+        self.last_raw = None;
+        self.seek(origin + start)
+    }
+
+    /// How long one pass of the section lasts, where that is known yet: to
+    /// its out point, or to the end of the last picture seen.
+    fn pass_length(&self) -> Option<Duration> {
+        let origin = self.origin.unwrap_or_default();
+        let end = match self.section_end {
+            Some(end) => origin + end,
+            None => self.last_raw? + self.frame_duration.unwrap_or(Duration::from_millis(40)),
+        };
+        Some(end.saturating_sub(origin + self.section_start))
+    }
+
+    /// The end of a pass: on into the next, or the end of the film.
+    fn end_pass(&mut self) -> Result<()> {
+        self.at_out = false;
+        let length = self.pass_length().filter(|length| !length.is_zero());
+        match (self.wraps, length) {
+            (true, Some(length)) => {
+                self.pass_offset += length;
+                let origin = self.origin.unwrap_or_default();
+                // The queue is left as it is: its pictures are still to show.
+                self.reposition(origin + self.section_start)
+            }
+            _ => {
+                self.eof_reached = true;
+                Ok(())
+            }
+        }
+    }
+
     /// Advance playback by decoding frames and filling the queue.
     ///
     /// Pulls packets from the demuxer, decodes them, applies plugins, and
@@ -204,6 +283,10 @@ impl VideoSource {
     /// decoder.
     pub fn advance(&mut self, _delta: Duration) -> Result<()> {
         while self.frame_queue.len() < QUEUE && !self.eof_reached {
+            if self.at_out {
+                self.end_pass()?;
+                continue;
+            }
             if self.serve_from_cache()? {
                 continue;
             }
@@ -234,7 +317,9 @@ impl VideoSource {
                         .as_ref()
                         .is_none_or(|cached| cached.decoder_in_step);
 
-                    self.eof_reached = in_step && !self.cache_has_next();
+                    if in_step && !self.cache_has_next() {
+                        self.end_pass()?;
+                    }
                 }
             }
         }
@@ -325,10 +410,17 @@ impl VideoSource {
         Ok(())
     }
 
-    /// Back to the start: the demuxer to the first keyframe, the decoder and
-    /// the queue emptied. What looping a film needs, without reopening it.
+    /// Back to the start — of the [section](Self::set_section), if one is
+    /// set: the demuxer to the keyframe before it, the decoder and the queue
+    /// emptied. What looping a film needs, without reopening it.
     pub fn rewind(&mut self) -> Result<()> {
-        self.seek(Duration::ZERO)
+        self.pass_offset = Duration::ZERO;
+        self.at_out = false;
+        if self.section_start.is_zero() {
+            return self.seek(Duration::ZERO);
+        }
+        let origin = self.origin.unwrap_or_default();
+        self.seek(origin + self.section_start)
     }
 
     /// Get the next frame if available (without removing it from the queue).
@@ -362,6 +454,21 @@ impl VideoSource {
             self.discard_before = None;
         }
 
+        // Past the out point the pass is over; whatever else comes out before
+        // the decoder is moved is not wanted.
+        if self.at_out {
+            return Ok(());
+        }
+        if let Some(end) = self.section_end {
+            // Half a frame of slack, as for a seek: a picture due a hair
+            // before the out point, by rounding, is the out point's.
+            let slack = self.frame_duration.unwrap_or_default() / 2;
+            if frame.pts() + slack >= self.origin.unwrap_or_default() + end {
+                self.at_out = true;
+                return Ok(());
+            }
+        }
+
         if let (Some(cached), Some(duration)) = (self.cache.as_mut(), self.frame_duration) {
             let origin = self.origin.unwrap_or_default();
             let number = frame_number(frame.pts().saturating_sub(origin), duration);
@@ -381,7 +488,8 @@ impl VideoSource {
             cached.next = number + 1;
         }
 
-        let mut frame = frame;
+        self.last_raw = Some(frame.pts());
+        let mut frame = if self.pass_offset.is_zero() { frame } else { frame.with_pts(frame.pts() + self.pass_offset) };
         for plugin in &mut self.plugins {
             frame = plugin.process(frame)?;
         }

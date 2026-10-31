@@ -5,6 +5,19 @@ as it lands (see `.claude/CLAUDE.md` in the sibling crates for the habit).
 
 **Done**
 
+- **In and out points, and seamless loops.** `Clip::in_point` and
+  `Clip::out_point` play part of a video, its sound and all, counted from its
+  first picture. `VideoSource::set_section(start, end, wraps)` is the same for
+  a source on its own. A looping clip no longer drains its queue and rewinds
+  at the end, which held the last picture while the decoder found its first
+  keyframe again: the source goes back to the in point while its last
+  pictures are still queued, and stamps the next pass's pictures on from where
+  the last ended, so the clock runs straight through the seam. A loop with no
+  out point turns at the film's length. The soundtrack plays the same section
+  through atome's `Section` and loops in the same `read`, so it has no gap
+  either and turns with the pictures (a source with a frame cache still
+  rewinds, now to its in point). Needs atome 0.8.9. 3 tests
+
 - **Builds for iOS and Android.** An app that turns on `window` and `tauri`
   for its desktop builds, as OrbitX does, now compiles for phones with the
   same feature list. `winit` is a desktop-only dependency, so `window` builds
