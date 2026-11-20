@@ -444,6 +444,10 @@ enum Content {
 pub(crate) enum Command {
     Add(ClipId, Box<Prepared>),
     Stop(ClipId),
+    /// To this opacity, over this long.
+    Opacity(ClipId, f32, Duration),
+    /// The clip's sound to this level (linear), over this long.
+    Gain(ClipId, f32, Duration),
     Snapshot(String, Sender<Result<Frame>>),
     SnapshotClip(ClipId, Sender<Result<Frame>>),
     Close,
@@ -694,6 +698,26 @@ impl Controls {
 
         lock(&self.shared.finished).insert(id);
         self.commands.send(Command::Stop(id)).is_ok()
+    }
+
+    /// Brings a playing clip's picture to `opacity` (0 transparent, 1 opaque)
+    /// over `over`, from wherever it is; `Duration::ZERO` is from the next
+    /// frame. The level holds until changed again. `false` for a clip that is
+    /// not running.
+    pub fn set_opacity(&self, id: ClipId, opacity: f32, over: Duration) -> bool {
+        let opacity = if opacity.is_finite() { opacity.clamp(0.0, 1.0) } else { 1.0 };
+        self.is_running(id) && self.commands.send(Command::Opacity(id, opacity, over)).is_ok()
+    }
+
+    /// Brings a playing clip's sound to `gain` (linear: 1 as the file is, 0
+    /// silent) over `over`, from wherever it is. Heard within one of atome's
+    /// buffers, as atome's `Scheduler::set_gain` is: what is queued but not yet
+    /// played is ramped. `false` for a clip that is not running; a clip with
+    /// no sound, or an engine without [`Audio::atome`], takes it and does
+    /// nothing.
+    pub fn set_gain(&self, id: ClipId, gain: f32, over: Duration) -> bool {
+        let gain = if gain.is_finite() { gain.max(0.0) } else { 1.0 };
+        self.is_running(id) && self.commands.send(Command::Gain(id, gain, over)).is_ok()
     }
 
     /// Whether a clip is on screen, or about to be: added, and not yet ended,
@@ -1001,6 +1025,8 @@ pub(crate) struct Core<W> {
     /// Soundtracks playing, by clip; dropping one stops it.
     #[cfg(feature = "atome")]
     soundtracks: HashMap<ClipId, crate::audio::Soundtrack>,
+    /// Opacity ramps under way, by clip: from, to, since when, and how long.
+    fades: HashMap<ClipId, (f32, f32, std::time::Instant, Duration)>,
 }
 
 /// How far ahead a clip with sound is started, so its first samples can be
@@ -1057,7 +1083,43 @@ impl<W> Core<W> {
             audio: audio.clone(),
             #[cfg(feature = "atome")]
             soundtracks: HashMap::new(),
+            fades: HashMap::new(),
         })
+    }
+
+    /// The opacity a clip's layer has now, wherever it is on screen.
+    fn opacity_of(&self, key: &str) -> Option<f32> {
+        (0..self.compositor.output_count())
+            .find_map(|index| self.compositor.get_output(index)?.get_layer(key).map(|layer| layer.opacity))
+    }
+
+    /// Sets a clip's layer to `opacity` on every output it is on.
+    fn set_layer_opacity(&mut self, key: &str, opacity: f32) {
+        for index in 0..self.compositor.output_count() {
+            if let Some(layer) = self.compositor.get_output_mut(index).and_then(|output| output.get_layer_mut(key)) {
+                layer.opacity = opacity;
+            }
+        }
+    }
+
+    /// Moves every opacity ramp on to now; a finished one is dropped.
+    fn step_fades(&mut self) {
+        let now = std::time::Instant::now();
+        let fades: Vec<(ClipId, f32, bool)> = self
+            .fades
+            .iter()
+            .map(|(id, (from, to, since, over))| {
+                let done = over.is_zero() || now.duration_since(*since) >= *over;
+                let t = if done { 1.0 } else { now.duration_since(*since).as_secs_f32() / over.as_secs_f32() };
+                (*id, from + (to - from) * t, done)
+            })
+            .collect();
+        for (id, opacity, done) in fades {
+            self.set_layer_opacity(&id.key(), opacity);
+            if done {
+                self.fades.remove(&id);
+            }
+        }
     }
 
     /// One frame: take commands, move every clip on, draw every output, and
@@ -1071,6 +1133,19 @@ impl<W> Core<W> {
                     self.compositor.remove_source(&id.key());
                     #[cfg(feature = "atome")]
                     self.soundtracks.remove(&id);
+                    self.fades.remove(&id);
+                }
+                Command::Opacity(id, opacity, over) => {
+                    let from = self.opacity_of(&id.key()).unwrap_or(opacity);
+                    self.fades.insert(id, (from, opacity, std::time::Instant::now(), over));
+                }
+                Command::Gain(id, gain, over) => {
+                    #[cfg(feature = "atome")]
+                    if let Some(soundtrack) = self.soundtracks.get(&id) {
+                        soundtrack.set_gain(gain, over);
+                    }
+                    #[cfg(not(feature = "atome"))]
+                    let _ = (id, gain, over);
                 }
                 Command::Snapshot(monitor, reply) => {
                     let _ = reply.send(self.snapshot(&monitor));
@@ -1082,8 +1157,11 @@ impl<W> Core<W> {
             }
         }
 
+        self.step_fades();
+
         for finished in self.compositor.tick() {
             if let Some(id) = parse_key(&finished.id) {
+                self.fades.remove(&id);
                 self.finish(id, finished.error.map(|error| error.to_string()));
             }
         }

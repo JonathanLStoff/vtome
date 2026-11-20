@@ -85,6 +85,14 @@ impl Soundtrack {
     }
 }
 
+impl Soundtrack {
+    /// Brings its sound to `gain` (linear) over `over`, on what atome has
+    /// queued but not yet played, and for everything fed after.
+    pub(crate) fn set_gain(&self, gain: f32, over: Duration) {
+        self.scheduler.set_gain(self.voice, gain, over);
+    }
+}
+
 impl Drop for Soundtrack {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Relaxed);

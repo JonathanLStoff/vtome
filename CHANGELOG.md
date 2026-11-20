@@ -5,6 +5,14 @@ as it lands (see `.claude/CLAUDE.md` in the sibling crates for the habit).
 
 **Done**
 
+- **Live opacity and sound level on a playing clip.** `Controls::set_opacity(id,
+  opacity, over)` ramps a clip's picture from wherever it is, once a frame, and
+  holds the level; `Controls::set_gain(id, gain, over)` ramps its sound on the
+  soundtrack's atome voice with atome's `Scheduler::set_gain`, so it is heard
+  within a buffer however far ahead the sound is fed. Both return `false` for a
+  clip that is not running. For mute, solo and fades in OrbitX. Needs atome
+  0.8.11. 0.3.9
+
 - **In and out points, and seamless loops.** `Clip::in_point` and
   `Clip::out_point` play part of a video, its sound and all, counted from its
   first picture. `VideoSource::set_section(start, end, wraps)` is the same for
