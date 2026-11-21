@@ -5,6 +5,16 @@ as it lands (see `.claude/CLAUDE.md` in the sibling crates for the habit).
 
 **Done**
 
+- **Transitions, a background, and vignette in the look.** `Look::transition`
+  (`Transition { kind: None | Wipe | Slide | Zoom, progress }`) reveals the picture
+  from the left, slides it in from the right, or grows it from the centre as
+  `progress` runs 0 to 1; animate it with `Controls::set_look(id, look, over)`, which
+  takes `over` on vtome's clock. `Look::background` is a colour (RGBA, straight)
+  filling the picture's box behind it, so a fade to a colour is a fade of the
+  picture over it. `Look::vignette` darkens the corners, in the same pass. Their
+  shader cost is a few multiplies per pixel. Not yet: several passes per clip, LUTs,
+  blur and sharpen. 0.3.11
+
 - **Per-clip look: colour and transform in the one draw pass.** `Clip::look(Look)`
   sets a clip's colour (brightness, contrast, saturation, hue, exposure, white
   balance, gamma), its transform (crop, zoom and pan, quarter turns, flips) and

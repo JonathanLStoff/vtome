@@ -39,6 +39,11 @@ struct Uniforms {
     gamma: f32,
     keyed: u32,
     look_pad: vec2<f32>,
+    // Transition kind (0 none, 1 wipe, 2 slide, 3 zoom), its progress, the
+    // vignette strength, unused.
+    effects: vec4<f32>,
+    // The background behind the picture, straight RGBA; alpha 0 is none.
+    background: vec4<f32>,
 }
 
 const MODE_RGBA: u32 = 0u;
@@ -85,9 +90,26 @@ fn fragment(@builtin(position) position: vec4<f32>) -> @location(0) vec4<f32> {
     let visible_w = step(0.00001, mapped.z);
     let quad_coordinates = mapped.xy / max(mapped.z, 0.00001);
 
+    // A transition moves the picture within its box before the look's transform:
+    // a wipe reveals it from the left, a slide brings it in from the right, a zoom
+    // grows it from the centre. Outside the picture stays transparent.
+    let kind = settings.effects.x;
+    let progress = settings.effects.y;
+    var moved = quad_coordinates;
+    var revealed = 1.0;
+    if kind == 1.0 {
+        revealed = step(moved.x, progress);
+    }
+    if kind == 2.0 {
+        moved.x = moved.x - (1.0 - progress);
+    }
+    if kind == 3.0 {
+        moved = vec2<f32>(0.5) + (moved - vec2<f32>(0.5)) / max(progress, 0.01);
+    }
+
     // The look's transform: crop, zoom, turn and flip, from the quad's unit
     // square to the picture's own texture coordinates.
-    let quad_point = vec3<f32>(quad_coordinates, 1.0);
+    let quad_point = vec3<f32>(moved, 1.0);
     let coordinates = vec2<f32>(
         dot(settings.transform[0].xyz, quad_point),
         dot(settings.transform[1].xyz, quad_point),
@@ -154,8 +176,21 @@ fn fragment(@builtin(position) position: vec4<f32>) -> @location(0) vec4<f32> {
     );
     graded = pow(max(graded, vec3<f32>(0.0)), vec3<f32>(settings.gamma));
 
-    let final_alpha = alpha * settings.opacity * inside * key_alpha;
+    // Vignette: darkens towards the corners of the box, the same pass.
+    let corner = length((quad_coordinates - vec2<f32>(0.5)) * 2.0);
+    graded = graded * (1.0 - settings.effects.z * smoothstep(0.4, 1.4, corner));
 
-    // Premultiplied out, to match the blend state the pipeline is built with.
-    return vec4<f32>(clamp(graded, vec3<f32>(0.0), vec3<f32>(1.0)) * final_alpha, final_alpha);
+    let final_alpha = alpha * settings.opacity * inside * key_alpha * revealed;
+
+    // The background fills the box behind the picture, so a faded picture shows
+    // it. Composed premultiplied, as the blend state expects.
+    let box_inside = step(0.0, quad_coordinates.x)
+        * step(quad_coordinates.x, 1.0)
+        * step(0.0, quad_coordinates.y)
+        * step(quad_coordinates.y, 1.0)
+        * visible_w;
+    let background_alpha = settings.background.a * box_inside;
+    let picture = clamp(graded, vec3<f32>(0.0), vec3<f32>(1.0)) * final_alpha;
+    let behind = settings.background.rgb * background_alpha * (1.0 - final_alpha);
+    return vec4<f32>(picture + behind, final_alpha + background_alpha * (1.0 - final_alpha));
 }

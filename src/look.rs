@@ -52,6 +52,43 @@ pub struct Look {
     pub flip_v: bool,
     /// Pixels close to this colour go transparent. `None` keeps every pixel.
     pub key: Option<ChromaKey>,
+    /// Darkens the corners: 0 is none, 1 is black at the very edge.
+    pub vignette: f32,
+    /// Shown behind the picture, inside its box, where the picture is not:
+    /// red, green, blue and alpha, straight. Alpha 0 is none. This is what a
+    /// fade to a colour fades into.
+    pub background: [f32; 4],
+    /// A transition in progress. See [`Transition`].
+    pub transition: Transition,
+}
+
+/// A transition the picture plays as it comes in or goes out.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Transition {
+    /// What moves.
+    pub kind: TransitionKind,
+    /// How far along it is: 0 is the start, 1 is the picture as it is. Animate it
+    /// with [`Controls::set_look`](crate::Controls::set_look).
+    pub progress: f32,
+}
+
+/// The shape of a [`Transition`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TransitionKind {
+    /// None: the picture is shown as it is.
+    None,
+    /// A reveal from the left edge, the picture hard against it.
+    Wipe,
+    /// The picture slides in from the right edge.
+    Slide,
+    /// The picture grows from the centre of its box.
+    Zoom,
+}
+
+impl Default for Transition {
+    fn default() -> Self {
+        Transition { kind: TransitionKind::None, progress: 1.0 }
+    }
 }
 
 /// A colour to make transparent, with how close is close enough.
@@ -84,6 +121,9 @@ impl Default for Look {
             flip_h: false,
             flip_v: false,
             key: None,
+            vignette: 0.0,
+            background: [0.0; 4],
+            transition: Transition::default(),
         }
     }
 }
@@ -101,6 +141,10 @@ pub(crate) struct Shaping {
     /// The exponent gamma raises the picture to: 1 / `gamma`.
     pub gamma: f32,
     pub keyed: bool,
+    /// Transition kind (0 none, 1 wipe, 2 slide, 3 zoom), progress, vignette strength, unused.
+    pub effects: [f32; 4],
+    /// The background, straight RGBA.
+    pub background: [f32; 4],
 }
 
 type Matrix3 = [[f64; 3]; 3];
@@ -303,6 +347,18 @@ impl Look {
             key,
             gamma: (1.0 / gamma) as f32,
             keyed,
+            effects: [
+                match self.transition.kind {
+                    TransitionKind::None => 0.0,
+                    TransitionKind::Wipe => 1.0,
+                    TransitionKind::Slide => 2.0,
+                    TransitionKind::Zoom => 3.0,
+                },
+                within(self.transition.progress, 0.0, 1.0, 1.0) as f32,
+                within(self.vignette, 0.0, 1.0, 0.0) as f32,
+                0.0,
+            ],
+            background: self.background.map(|channel| if channel.is_finite() { channel.clamp(0.0, 1.0) } else { 0.0 }),
         }
     }
 
@@ -338,6 +394,10 @@ impl Look {
             flip_h: to.flip_h,
             flip_v: to.flip_v,
             key,
+            vignette: mix(self.vignette, to.vignette),
+            background: mix4(self.background, to.background),
+            // A transition's kind switches at once; its progress runs over the ramp.
+            transition: Transition { kind: to.transition.kind, progress: mix(self.transition.progress, to.transition.progress) },
         }
     }
 }

@@ -192,7 +192,7 @@ pub use encode::Encoder;
 pub use error::{Error, Result};
 pub use frame::{Frame, FramePool, PixelFormat};
 pub use geometry::{Fit, Point, Quad, Rect};
-pub use look::{ChromaKey, Look};
+pub use look::{ChromaKey, Look, Transition, TransitionKind};
 pub use identify::{identify_bytes, identify_path, Container, Encoding};
 pub use media::{MediaInfo, Packet, TrackInfo, TrackKind};
 pub use output::Output;

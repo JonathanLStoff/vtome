@@ -181,6 +181,10 @@ struct Uniforms {
     keyed: u32,
     /// Pads the block to 16 bytes.
     _pad: [f32; 2],
+    /// Transition kind, progress, vignette strength, unused.
+    effects: [f32; 4],
+    /// The background behind the picture, straight RGBA.
+    background: [f32; 4],
 }
 
 /// The textures one frame lives in, and what shape they were made for.
@@ -513,6 +517,8 @@ impl Renderer {
                     gamma: look.gamma,
                     keyed: u32::from(look.keyed),
                     _pad: [0.0; 2],
+                    effects: look.effects,
+                    background: look.background,
                 },
             ));
         }
