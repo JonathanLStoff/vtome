@@ -5,6 +5,10 @@ as it lands (see `.claude/CLAUDE.md` in the sibling crates for the habit).
 
 **Done**
 
+- **A callback when a clip finishes (0.3.12).** `Controls::on_finished(id, then)`
+  runs `then` once the clip ends, fails or is stopped (at once if it already
+  has), so a thread waiting on a video can park and be unparked rather than ask
+  `is_finished` every few milliseconds.
 - **Transitions, a background, and vignette in the look.** `Look::transition`
   (`Transition { kind: None | Wipe | Slide | Zoom, progress }`) reveals the picture
   from the left, slides it in from the right, or grows it from the centre as

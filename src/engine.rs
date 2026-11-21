@@ -479,6 +479,9 @@ pub(crate) struct Shared {
     /// so this only grows — by eight bytes a clip.
     finished: Mutex<HashSet<ClipId>>,
     ended: Mutex<Vec<ClipEnded>>,
+    /// What to run when a clip finishes ([`Controls::on_finished`]). Locked before `finished`
+    /// wherever both are, so a callback is never missed between the two.
+    waiters: Mutex<HashMap<ClipId, Vec<Waiter>>>,
     closed: AtomicBool,
     /// Refreshes the engine has run.
     frames: AtomicU64,
@@ -488,6 +491,23 @@ pub(crate) struct Shared {
 
 fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// Run once when its clip finishes.
+type Waiter = Box<dyn FnOnce() + Send>;
+
+impl Shared {
+    /// Marks `id` finished and runs what was waiting for it, outside the locks.
+    fn mark_finished(&self, id: ClipId) {
+        let waiting = {
+            let mut waiters = lock(&self.waiters);
+            lock(&self.finished).insert(id);
+            waiters.remove(&id).unwrap_or_default()
+        };
+        for waiter in waiting {
+            waiter();
+        }
+    }
 }
 
 /// Adds and stops clips from any thread, while the engine runs on its own.
@@ -710,7 +730,7 @@ impl Controls {
             return false;
         }
 
-        lock(&self.shared.finished).insert(id);
+        self.shared.mark_finished(id);
         self.commands.send(Command::Stop(id)).is_ok()
     }
 
@@ -745,6 +765,22 @@ impl Controls {
     /// failed, or stopped.
     pub fn is_running(&self, id: ClipId) -> bool {
         lock(&self.shared.active).contains(&id)
+    }
+
+    /// Runs `then` once `id` is over (ended, failed or stopped), on whichever
+    /// thread finishes it, or at once if it already is: so a thread waiting on
+    /// a clip can sleep until woken (`thread::park` and an `unpark` here)
+    /// rather than ask [`is_finished`](Self::is_finished) over and over. Keep
+    /// it short: it runs on the engine's thread when the clip ends there.
+    pub fn on_finished(&self, id: ClipId, then: impl FnOnce() + Send + 'static) {
+        {
+            let mut waiters = lock(&self.shared.waiters);
+            if !lock(&self.shared.finished).contains(&id) {
+                waiters.entry(id).or_default().push(Box::new(then));
+                return;
+            }
+        }
+        then();
     }
 
     /// Whether a clip is over: it ended, failed, or was stopped. `false` for
@@ -1389,8 +1425,8 @@ impl<W> Core<W> {
         #[cfg(feature = "atome")]
         self.soundtracks.remove(&id);
         lock(&self.shared.active).remove(&id);
-        lock(&self.shared.finished).insert(id);
         lock(&self.shared.ended).push(ClipEnded { id, error });
+        self.shared.mark_finished(id);
     }
 
     /// The screens, for closing their windows once the engine stops.
