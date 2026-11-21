@@ -176,6 +176,7 @@ pub struct Clip {
     z_index: i32,
     hold: Hold,
     looping: bool,
+    hold_end: bool,
     start_at: Option<Duration>,
     in_point: Duration,
     out_point: Option<Duration>,
@@ -277,6 +278,7 @@ impl Clip {
             z_index: 0,
             hold: Hold::Forever,
             looping: false,
+            hold_end: false,
             start_at: None,
             in_point: Duration::ZERO,
             out_point: None,
@@ -369,6 +371,14 @@ impl Clip {
         self
     }
 
+    /// Whether a video holds its last picture when it ends, rather than going.
+    /// Off by default. Held, the clip stays up until [`stop`](Controls::stop)ped
+    /// and [`Controls::is_held`] says so; its sound has ended. Stills ignore it.
+    pub fn hold_end(mut self, hold: bool) -> Self {
+        self.hold_end = hold;
+        self
+    }
+
     /// Where in the video it starts: this far after its first picture, sound
     /// and all. A trim; the start of the film by default. Stills ignore it.
     pub fn in_point(mut self, position: Duration) -> Self {
@@ -436,6 +446,7 @@ pub(crate) struct Prepared {
     look: Look,
     z_index: i32,
     looping: bool,
+    hold_end: bool,
     start_at: Option<Duration>,
     /// The part of the film played, from its first picture, as the source
     /// was set to it: its sound plays the same part.
@@ -479,6 +490,8 @@ pub(crate) struct Shared {
     /// so this only grows — by eight bytes a clip.
     finished: Mutex<HashSet<ClipId>>,
     ended: Mutex<Vec<ClipEnded>>,
+    /// Videos that ended holding their last picture ([`Clip::hold_end`]), until stopped.
+    held: Mutex<HashSet<ClipId>>,
     /// What to run when a clip finishes ([`Controls::on_finished`]). Locked before `finished`
     /// wherever both are, so a callback is never missed between the two.
     waiters: Mutex<HashMap<ClipId, Vec<Waiter>>>,
@@ -682,6 +695,7 @@ impl Controls {
             look: clip.look,
             z_index: clip.z_index,
             looping: clip.looping,
+            hold_end: clip.hold_end,
             start_at: clip.start_at,
             section,
             soundtrack,
@@ -730,6 +744,7 @@ impl Controls {
             return false;
         }
 
+        lock(&self.shared.held).remove(&id);
         self.shared.mark_finished(id);
         self.commands.send(Command::Stop(id)).is_ok()
     }
@@ -788,6 +803,12 @@ impl Controls {
     /// two questions are not each other's opposite.
     pub fn is_finished(&self, id: ClipId) -> bool {
         lock(&self.shared.finished).contains(&id)
+    }
+
+    /// Whether a video has ended and is holding its last picture
+    /// ([`Clip::hold_end`]): up until stopped, its sound over.
+    pub fn is_held(&self, id: ClipId) -> bool {
+        lock(&self.shared.held).contains(&id)
     }
 
     /// Where the engine's timeline is now — atome's output clock with
@@ -1251,6 +1272,13 @@ impl<W> Core<W> {
                 self.finish(id, finished.error.map(|error| error.to_string()));
             }
         }
+        for key in self.compositor.take_held() {
+            if let Some(id) = parse_key(&key) {
+                #[cfg(feature = "atome")]
+                self.soundtracks.remove(&id);
+                lock(&self.shared.held).insert(id);
+            }
+        }
 
         for screen in &mut self.screens {
             use wgpu::CurrentSurfaceTexture;
@@ -1326,6 +1354,9 @@ impl<W> Core<W> {
             Content::Video(source) => {
                 self.compositor
                     .insert_video_at(&key, source, prepared.looping, start_at);
+                if prepared.hold_end {
+                    self.compositor.hold_at_end(&key);
+                }
             }
             Content::Still { frame, frames } => self.compositor.insert_still(&key, frame, frames),
         }
@@ -1425,6 +1456,7 @@ impl<W> Core<W> {
         #[cfg(feature = "atome")]
         self.soundtracks.remove(&id);
         lock(&self.shared.active).remove(&id);
+        lock(&self.shared.held).remove(&id);
         lock(&self.shared.ended).push(ClipEnded { id, error });
         self.shared.mark_finished(id);
     }

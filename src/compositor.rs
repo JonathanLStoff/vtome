@@ -37,6 +37,8 @@ use crate::render::{Gpu, Layer, Picture, Renderer};
 ///    [`presented`](Compositor::presented) once they are on screen
 pub struct Compositor {
     sources: HashMap<String, Source>,
+    /// Films that ended holding their last picture since [`take_held`](Compositor::take_held).
+    held: Vec<String>,
     outputs: Vec<Output>,
     /// Each source's look, by source id. A source without one is drawn as it is.
     looks: HashMap<String, Look>,
@@ -54,6 +56,8 @@ struct Source {
     showing: Option<Frame>,
     /// Goes up whenever `showing` changes, so each output uploads only then.
     generation: u64,
+    /// A film that ends becomes a still of its last picture instead of going.
+    hold_end: bool,
 }
 
 enum Kind {
@@ -86,6 +90,7 @@ impl Compositor {
     pub fn with_clock(timeline: SharedClock) -> Self {
         Compositor {
             sources: HashMap::new(),
+            held: Vec::new(),
             outputs: Vec::new(),
             looks: HashMap::new(),
             timeline,
@@ -145,6 +150,7 @@ impl Compositor {
                 kind: Kind::Video(Box::new(playback)),
                 showing: None,
                 generation: 0,
+                hold_end: false,
             },
         );
     }
@@ -176,8 +182,22 @@ impl Compositor {
                 },
                 showing: Some(frame),
                 generation: 1,
+                hold_end: false,
             },
         );
+    }
+
+    /// Makes film `id` hold its last picture when it ends, rather than going:
+    /// it is then a still until removed, and named once by [`take_held`](Compositor::take_held).
+    pub fn hold_at_end(&mut self, id: &str) {
+        if let Some(source) = self.sources.get_mut(id) {
+            source.hold_end = true;
+        }
+    }
+
+    /// The films that ended holding their last picture since this was last asked.
+    pub fn take_held(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.held)
     }
 
     /// Removes a source and every layer, on every output, that showed it.
@@ -294,6 +314,11 @@ impl Compositor {
                         source.generation += 1;
                     }
                     Ok(Tick::Hold) => {}
+                    // Held: its last picture stays up, as a still, until removed.
+                    Ok(Tick::Ended) if source.hold_end && source.showing.is_some() => {
+                        source.kind = Kind::Still { frames_left: None };
+                        self.held.push(id.clone());
+                    }
                     Ok(Tick::Ended) => finished.push(Finished {
                         id: id.clone(),
                         error: None,

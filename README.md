@@ -163,7 +163,7 @@ not yet been run on those systems' hardware.
 
 ```toml
 [dependencies]
-vtome = { version = "0.3.12", default-features = false, features = ["demux"] }
+vtome = { version = "0.3.13", default-features = false, features = ["demux"] }
 ```
 
 | Feature | What it adds | Default |

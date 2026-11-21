@@ -5,6 +5,9 @@ as it lands (see `.claude/CLAUDE.md` in the sibling crates for the habit).
 
 **Done**
 
+- **Hold the last picture (0.3.13).** `Clip::hold_end(true)` keeps a video's
+  last picture up when it ends, until stopped, instead of the clip going;
+  `Controls::is_held(id)` says it has ended and is holding. Its sound is over.
 - **A callback when a clip finishes (0.3.12).** `Controls::on_finished(id, then)`
   runs `then` once the clip ends, fails or is stopped (at once if it already
   has), so a thread waiting on a video can park and be unparked rather than ask
