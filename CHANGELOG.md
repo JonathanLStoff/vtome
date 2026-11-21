@@ -5,6 +5,17 @@ as it lands (see `.claude/CLAUDE.md` in the sibling crates for the habit).
 
 **Done**
 
+- **Per-clip look: colour and transform in the one draw pass.** `Clip::look(Look)`
+  sets a clip's colour (brightness, contrast, saturation, hue, exposure, white
+  balance, gamma), its transform (crop, zoom and pan, quarter turns, flips) and
+  an optional chroma key (`ChromaKey`, on Cb/Cr). All of it is folded into the
+  clip's existing fragment shader, so it costs no extra pass. `Controls::set_look(id,
+  look, over)` moves a playing clip to a look over `over`, from wherever it is, as
+  `set_opacity` does. A default `Look` changes nothing. Pictures are now drawn
+  premultiplied, as the render docs always said: the old straight-alpha blend
+  was wrong at partial opacity. Not yet: LUTs, blur and sharpen, transition
+  wipes and slides. Measure the frame cost on a device before relying on it.
+
 - **Live opacity and sound level on a playing clip.** `Controls::set_opacity(id,
   opacity, over)` ramps a clip's picture from wherever it is, once a frame, and
   holds the level; `Controls::set_gain(id, gain, over)` ramps its sound on the

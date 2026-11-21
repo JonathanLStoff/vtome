@@ -17,6 +17,7 @@ use std::path::Path;
 use crate::clock::{Monotonic, SharedClock};
 use crate::error::{Error, Result};
 use crate::frame::Frame;
+use crate::look::Look;
 use crate::output::Output;
 use crate::playback::{Playback, Tick};
 use crate::video_source::VideoSource;
@@ -37,6 +38,8 @@ use crate::render::{Gpu, Layer, Picture, Renderer};
 pub struct Compositor {
     sources: HashMap<String, Source>,
     outputs: Vec<Output>,
+    /// Each source's look, by source id. A source without one is drawn as it is.
+    looks: HashMap<String, Look>,
     /// The one timeline every film follows — see [`crate::clock`].
     timeline: SharedClock,
     /// What each output has on the GPU, index for index with `outputs`.
@@ -84,6 +87,7 @@ impl Compositor {
         Compositor {
             sources: HashMap::new(),
             outputs: Vec::new(),
+            looks: HashMap::new(),
             timeline,
             #[cfg(feature = "render")]
             gpu: Vec::new(),
@@ -180,12 +184,23 @@ impl Compositor {
     /// Whether there was one.
     pub fn remove_source(&mut self, id: &str) -> bool {
         let existed = self.sources.remove(id).is_some();
+        self.looks.remove(id);
 
         for output in &mut self.outputs {
             output.remove_layer(id);
         }
 
         existed
+    }
+
+    /// Sets the look a source is drawn with, from now on.
+    pub(crate) fn set_look(&mut self, id: &str, look: Look) {
+        self.looks.insert(id.to_string(), look);
+    }
+
+    /// The look a source is drawn with now.
+    pub(crate) fn look_of(&self, id: &str) -> Look {
+        self.looks.get(id).copied().unwrap_or_default()
     }
 
     /// Whether a source with this id exists.
@@ -361,8 +376,8 @@ impl Compositor {
         width: u32,
         height: u32,
     ) -> Result<()> {
-        self.compose(index, gpu, renderer, width, height, |clear, layers| {
-            renderer.draw_layers(gpu, view, width, height, clear, layers)
+        self.compose(index, gpu, renderer, width, height, |clear, layers, looks| {
+            renderer.draw_layers_looked(gpu, view, width, height, clear, layers, looks)
         })
     }
 
@@ -382,8 +397,8 @@ impl Compositor {
         width: u32,
         height: u32,
     ) -> Result<Vec<u8>> {
-        self.compose(index, gpu, renderer, width, height, |clear, layers| {
-            renderer.render_layers_to_rgba(gpu, width, height, clear, layers)
+        self.compose(index, gpu, renderer, width, height, |clear, layers, looks| {
+            renderer.render_layers_looked(gpu, width, height, clear, layers, looks)
         })
     }
 
@@ -397,7 +412,7 @@ impl Compositor {
         renderer: &Renderer,
         width: u32,
         height: u32,
-        finish: impl FnOnce(wgpu::Color, &[Layer<'_>]) -> Result<T>,
+        finish: impl FnOnce(wgpu::Color, &[Layer<'_>], &[Look]) -> Result<T>,
     ) -> Result<T> {
         use crate::geometry::{Quad, Rect};
 
@@ -482,20 +497,23 @@ impl Compositor {
                 layer.bounds.height * scale_y,
             );
 
-            let rect = layer
-                .fit
-                .apply(f64::from(frame.width()), f64::from(frame.height()), bounds);
+            // Fitted by the picture as it is shown: a crop or a turn changes its shape.
+            let look = self.looks.get(id).copied().unwrap_or_default();
+            let (shown_width, shown_height) =
+                look.visible_size(f64::from(frame.width()), f64::from(frame.height()));
+            let rect = layer.fit.apply(shown_width, shown_height, bounds);
 
-            placed.push((key, Quad::from_rect(rect), layer.opacity));
+            placed.push((key, Quad::from_rect(rect), layer.opacity, look));
         }
 
         // Pictures for sources that went away, or appear fewer times now, go
         // with them.
         let live: std::collections::HashSet<&(String, usize)> =
-            placed.iter().map(|(key, _, _)| key).collect();
+            placed.iter().map(|(key, _, _, _)| key).collect();
         state.pictures.retain(|key, _| live.contains(key));
 
         let mut layers = Vec::with_capacity(placed.len() + 1);
+        let mut looks = Vec::with_capacity(placed.len() + 1);
 
         if let Some(background) = &state.background {
             let (image_width, image_height) = background.size;
@@ -511,14 +529,16 @@ impl Compositor {
                 quad: Quad::from_rect(rect),
                 opacity: 1.0,
             });
+            looks.push(Look::default());
         }
 
-        for (key, quad, opacity) in &placed {
+        for (key, quad, opacity, look) in &placed {
             layers.push(Layer {
                 picture: &state.pictures[key].0,
                 quad: *quad,
                 opacity: *opacity,
             });
+            looks.push(*look);
         }
 
         // Premultiplied, as `draw_layers` wants its clear colour.
@@ -530,7 +550,7 @@ impl Compositor {
             a: alpha,
         };
 
-        finish(clear, &layers)
+        finish(clear, &layers, &looks)
     }
 
     /// Get all output dimensions as (width, height) tuples.

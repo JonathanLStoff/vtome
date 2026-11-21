@@ -20,6 +20,7 @@ use crate::compositor::Compositor;
 use crate::error::{Error, Result};
 use crate::frame::Frame;
 use crate::geometry::{Fit, Rect};
+use crate::look::{ramp_done, Look};
 use crate::output::Output;
 use crate::output_layer::OutputLayer;
 use crate::placement::Monitor;
@@ -179,6 +180,7 @@ pub struct Clip {
     in_point: Duration,
     out_point: Option<Duration>,
     audio: Option<AudioMedia>,
+    look: Look,
 }
 
 #[derive(Clone, Debug)]
@@ -279,6 +281,7 @@ impl Clip {
             in_point: Duration::ZERO,
             out_point: None,
             audio: None,
+            look: Look::default(),
         }
     }
 
@@ -324,6 +327,13 @@ impl Clip {
     /// 0.0 to 1.0.
     pub fn opacity(mut self, opacity: f32) -> Self {
         self.opacity = opacity.clamp(0.0, 1.0);
+        self
+    }
+
+    /// The colour and transform the picture is drawn with: see [`Look`]. Changed
+    /// while it plays with [`Controls::set_look`].
+    pub fn look(mut self, look: Look) -> Self {
+        self.look = look;
         self
     }
 
@@ -423,6 +433,7 @@ pub(crate) struct Prepared {
     area: Option<Rect>,
     fit: Fit,
     opacity: f32,
+    look: Look,
     z_index: i32,
     looping: bool,
     start_at: Option<Duration>,
@@ -446,6 +457,8 @@ pub(crate) enum Command {
     Stop(ClipId),
     /// To this opacity, over this long.
     Opacity(ClipId, f32, Duration),
+    /// The clip's colour and transform, to this look over this long.
+    Look(ClipId, Box<Look>, Duration),
     /// The clip's sound to this level (linear), over this long.
     Gain(ClipId, f32, Duration),
     Snapshot(String, Sender<Result<Frame>>),
@@ -646,6 +659,7 @@ impl Controls {
             area: clip.area,
             fit: clip.fit,
             opacity: clip.opacity,
+            look: clip.look,
             z_index: clip.z_index,
             looping: clip.looping,
             start_at: clip.start_at,
@@ -707,6 +721,13 @@ impl Controls {
     pub fn set_opacity(&self, id: ClipId, opacity: f32, over: Duration) -> bool {
         let opacity = if opacity.is_finite() { opacity.clamp(0.0, 1.0) } else { 1.0 };
         self.is_running(id) && self.commands.send(Command::Opacity(id, opacity, over)).is_ok()
+    }
+
+    /// Moves a playing clip's colour and transform to `look` over `over`, from
+    /// wherever it is now; `Duration::ZERO` is from the next frame. The look
+    /// holds until changed again. `false` for a clip that is not running.
+    pub fn set_look(&self, id: ClipId, look: Look, over: Duration) -> bool {
+        self.is_running(id) && self.commands.send(Command::Look(id, Box::new(look), over)).is_ok()
     }
 
     /// Brings a playing clip's sound to `gain` (linear: 1 as the file is, 0
@@ -1027,6 +1048,8 @@ pub(crate) struct Core<W> {
     soundtracks: HashMap<ClipId, crate::audio::Soundtrack>,
     /// Opacity ramps under way, by clip: from, to, since when, and how long.
     fades: HashMap<ClipId, (f32, f32, std::time::Instant, Duration)>,
+    /// Look ramps under way, by clip: from, to, since when, and how long.
+    looks: HashMap<ClipId, (Look, Look, std::time::Instant, Duration)>,
 }
 
 /// How far ahead a clip with sound is started, so its first samples can be
@@ -1084,6 +1107,7 @@ impl<W> Core<W> {
             #[cfg(feature = "atome")]
             soundtracks: HashMap::new(),
             fades: HashMap::new(),
+            looks: HashMap::new(),
         })
     }
 
@@ -1122,6 +1146,25 @@ impl<W> Core<W> {
         }
     }
 
+    /// Moves every look ramp on to now; a finished one is dropped.
+    fn step_looks(&mut self) {
+        let now = std::time::Instant::now();
+        let steps: Vec<(ClipId, Look, bool)> = self
+            .looks
+            .iter()
+            .map(|(id, (from, to, since, over))| {
+                let (t, done) = ramp_done(*since, *over, now);
+                (*id, from.toward(to, t), done)
+            })
+            .collect();
+        for (id, look, done) in steps {
+            self.compositor.set_look(&id.key(), look);
+            if done {
+                self.looks.remove(&id);
+            }
+        }
+    }
+
     /// One frame: take commands, move every clip on, draw every output, and
     /// present. `false` once the engine has been told to close.
     pub(crate) fn refresh(&mut self) -> Result<bool> {
@@ -1134,10 +1177,15 @@ impl<W> Core<W> {
                     #[cfg(feature = "atome")]
                     self.soundtracks.remove(&id);
                     self.fades.remove(&id);
+                    self.looks.remove(&id);
                 }
                 Command::Opacity(id, opacity, over) => {
                     let from = self.opacity_of(&id.key()).unwrap_or(opacity);
                     self.fades.insert(id, (from, opacity, std::time::Instant::now(), over));
+                }
+                Command::Look(id, look, over) => {
+                    let from = self.compositor.look_of(&id.key());
+                    self.looks.insert(id, (from, *look, std::time::Instant::now(), over));
                 }
                 Command::Gain(id, gain, over) => {
                     #[cfg(feature = "atome")]
@@ -1158,10 +1206,12 @@ impl<W> Core<W> {
         }
 
         self.step_fades();
+        self.step_looks();
 
         for finished in self.compositor.tick() {
             if let Some(id) = parse_key(&finished.id) {
                 self.fades.remove(&id);
+                self.looks.remove(&id);
                 self.finish(id, finished.error.map(|error| error.to_string()));
             }
         }
@@ -1243,6 +1293,8 @@ impl<W> Core<W> {
             }
             Content::Still { frame, frames } => self.compositor.insert_still(&key, frame, frames),
         }
+
+        self.compositor.set_look(&key, prepared.look);
 
         if let Some(target) = self.compositor.get_output_mut(output) {
             let area = prepared.area.unwrap_or_else(|| {

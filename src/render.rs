@@ -40,6 +40,7 @@
 use crate::error::{Error, Result};
 use crate::frame::{Frame, PixelFormat};
 use crate::geometry::{Mat3, Quad};
+use crate::look::Look;
 
 /// The shader. One file, because splitting a 60-line shader across files helps
 /// nobody.
@@ -168,6 +169,18 @@ struct Uniforms {
     opacity: f32,
     /// Which [`Mode`].
     mode: u32,
+    /// Rows of the 2×3 texture transform from the crop, zoom and turn.
+    transform: [[f32; 4]; 2],
+    /// Rows of the colour matrix, with the offset in `w`.
+    grade: [[f32; 4]; 4],
+    /// Chroma of the key colour, then its tolerance and softness.
+    key: [f32; 4],
+    /// The exponent gamma raises the picture to.
+    gamma: f32,
+    /// 1 when a key is set; a `u32` because WGSL has no bool in a uniform.
+    keyed: u32,
+    /// Pads the block to 16 bytes.
+    _pad: [f32; 2],
 }
 
 /// The textures one frame lives in, and what shape they were made for.
@@ -311,10 +324,11 @@ impl Renderer {
                 entry_point: Some("fragment"),
                 targets: &[Some(wgpu::ColorTargetState {
                     format,
-                    // Straight alpha: the shader hands back zero alpha outside
-                    // the quad, which is how a trapezoid leaves the rest of the
-                    // surface alone rather than painting it black.
-                    blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                    // Premultiplied, as the shader writes it: colour already times
+                    // its alpha. Zero alpha outside the quad is how a trapezoid
+                    // leaves the rest of the surface alone rather than painting it
+                    // black.
+                    blend: Some(wgpu::BlendState::PREMULTIPLIED_ALPHA_BLENDING),
                     write_mask: wgpu::ColorWrites::ALL,
                 })],
                 compilation_options: Default::default(),
@@ -443,6 +457,21 @@ impl Renderer {
         clear: wgpu::Color,
         layers: &[Layer<'_>],
     ) -> Result<()> {
+        self.draw_layers_looked(gpu, view, target_width, target_height, clear, layers, &[])
+    }
+
+    /// [`draw_layers`](Renderer::draw_layers) with each layer's [`Look`] in
+    /// `looks`, index for index. A layer without one is drawn as it is.
+    pub(crate) fn draw_layers_looked(
+        &self,
+        gpu: &Gpu,
+        view: &wgpu::TextureView,
+        target_width: u32,
+        target_height: u32,
+        clear: wgpu::Color,
+        layers: &[Layer<'_>],
+        looks: &[Look],
+    ) -> Result<()> {
         let mut prepared = Vec::with_capacity(layers.len());
 
         for (index, layer) in layers.iter().enumerate() {
@@ -468,6 +497,7 @@ impl Renderer {
             // Working this way round is what makes the perspective divide
             // per-pixel.
             let inverse = layer.quad.inverse_homography()?;
+            let look = looks.get(index).copied().unwrap_or_default().shaping();
 
             prepared.push((
                 planes,
@@ -477,6 +507,12 @@ impl Renderer {
                     target_size: [target_width as f32, target_height as f32],
                     opacity: layer.opacity.clamp(0.0, 1.0),
                     mode: mode_for(planes.format)? as u32,
+                    transform: look.transform,
+                    grade: look.grade,
+                    key: look.key,
+                    gamma: look.gamma,
+                    keyed: u32::from(look.keyed),
+                    _pad: [0.0; 2],
                 },
             ));
         }
@@ -571,10 +607,24 @@ impl Renderer {
         clear: wgpu::Color,
         layers: &[Layer<'_>],
     ) -> Result<Vec<u8>> {
+        self.render_layers_looked(gpu, width, height, clear, layers, &[])
+    }
+
+    /// [`render_layers_to_rgba`](Renderer::render_layers_to_rgba) with each
+    /// layer's [`Look`] in `looks`, index for index.
+    pub(crate) fn render_layers_looked(
+        &self,
+        gpu: &Gpu,
+        width: u32,
+        height: u32,
+        clear: wgpu::Color,
+        layers: &[Layer<'_>],
+        looks: &[Look],
+    ) -> Result<Vec<u8>> {
         self.require_rgba8()?;
 
         read_back(gpu, self.format, width, height, |view| {
-            self.draw_layers(gpu, view, width, height, clear, layers)
+            self.draw_layers_looked(gpu, view, width, height, clear, layers, looks)
         })
     }
 

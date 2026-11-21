@@ -9,6 +9,11 @@
 // The divide by w below is the perspective correction. Doing it per pixel is
 // what a two-triangle mesh cannot do, and its absence is the crease that shows
 // up down the diagonal of every keystoned projection.
+//
+// A clip's look rides in the same pass: a 2×3 transform of the texture
+// coordinates (crop, zoom, turn, flip), a chroma key on the alpha, and a 4×4
+// colour matrix with a gamma. Each costs a few multiplies per pixel, and each
+// is the identity for a clip with no look.
 
 struct Uniforms {
     // Rows of the inverse homography: target pixels -> the unit square.
@@ -23,6 +28,17 @@ struct Uniforms {
     target_size: vec2<f32>,
     opacity: f32,
     mode: u32,
+    // Rows of the 2×3 map from the unit square to texture coordinates. The
+    // translation is in w.
+    transform: array<vec4<f32>, 2>,
+    // Rows of the colour matrix, applied to (r, g, b, 1).
+    grade: array<vec4<f32>, 4>,
+    // Chroma of the key colour (Cb, Cr), tolerance, softness.
+    key: vec4<f32>,
+    // Exponent for the picture after the colour matrix: 1 / gamma.
+    gamma: f32,
+    keyed: u32,
+    look_pad: vec2<f32>,
 }
 
 const MODE_RGBA: u32 = 0u;
@@ -45,6 +61,15 @@ fn vertex(@builtin(vertex_index) index: u32) -> @builtin(position) vec4<f32> {
     return vec4<f32>(x, y, 0.0, 1.0);
 }
 
+// Transparent where the pixel is close to the key colour, opaque where it is
+// not. Chroma (Cb, Cr) rather than RGB, so a shadow on a green screen still keys.
+fn chroma_key(rgb: vec3<f32>) -> f32 {
+    let luma = dot(rgb, vec3<f32>(0.2126, 0.7152, 0.0722));
+    let chroma = vec2<f32>((rgb.b - luma) / 1.8556, (rgb.r - luma) / 1.5748);
+    let distance = length(chroma - settings.key.xy);
+    return smoothstep(settings.key.z, settings.key.z + max(settings.key.w, 0.0001), distance);
+}
+
 @fragment
 fn fragment(@builtin(position) position: vec4<f32>) -> @location(0) vec4<f32> {
     // The pixel's centre, in the same coordinates the quad was given in.
@@ -58,12 +83,21 @@ fn fragment(@builtin(position) position: vec4<f32>) -> @location(0) vec4<f32> {
 
     // Behind the horizon of the projective map: there is no texel there.
     let visible_w = step(0.00001, mapped.z);
-    let coordinates = mapped.xy / max(mapped.z, 0.00001);
+    let quad_coordinates = mapped.xy / max(mapped.z, 0.00001);
+
+    // The look's transform: crop, zoom, turn and flip, from the quad's unit
+    // square to the picture's own texture coordinates.
+    let quad_point = vec3<f32>(quad_coordinates, 1.0);
+    let coordinates = vec2<f32>(
+        dot(settings.transform[0].xyz, quad_point),
+        dot(settings.transform[1].xyz, quad_point),
+    );
 
     // Outside the picture is transparent rather than clamped, so a quad smaller
-    // than the target leaves the rest of the surface alone. Computed as a
-    // factor rather than a `discard` so that sampling stays in uniform control
-    // flow — a discarded fragment must not change what its neighbours may do.
+    // than the target leaves the rest of the surface alone, and a crop or zoom
+    // never shows the picture's edge repeated. Computed as a factor rather than
+    // a `discard` so that sampling stays in uniform control flow — a discarded
+    // fragment must not change what its neighbours may do.
     let inside = step(0.0, coordinates.x)
         * step(coordinates.x, 1.0)
         * step(0.0, coordinates.y)
@@ -104,5 +138,24 @@ fn fragment(@builtin(position) position: vec4<f32>) -> @location(0) vec4<f32> {
         );
     }
 
-    return vec4<f32>(clamp(color, vec3<f32>(0.0), vec3<f32>(1.0)), alpha * settings.opacity * inside);
+    // The key tests the picture as it came in, before any colour control.
+    var key_alpha = 1.0;
+    if settings.keyed == 1u {
+        key_alpha = chroma_key(clamp(color, vec3<f32>(0.0), vec3<f32>(1.0)));
+    }
+
+    // Colour controls: one matrix with its offset, then gamma. The matrix can
+    // push a channel below zero, which a power cannot take, so it is floored first.
+    let lit = vec4<f32>(color, 1.0);
+    var graded = vec3<f32>(
+        dot(settings.grade[0], lit),
+        dot(settings.grade[1], lit),
+        dot(settings.grade[2], lit),
+    );
+    graded = pow(max(graded, vec3<f32>(0.0)), vec3<f32>(settings.gamma));
+
+    let final_alpha = alpha * settings.opacity * inside * key_alpha;
+
+    // Premultiplied out, to match the blend state the pipeline is built with.
+    return vec4<f32>(clamp(graded, vec3<f32>(0.0), vec3<f32>(1.0)) * final_alpha, final_alpha);
 }

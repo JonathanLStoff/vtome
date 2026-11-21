@@ -81,6 +81,7 @@ impl<T: std::io::Read + std::io::Seek + Send + Sync> ReadSeek for T {}
 pub mod frame;
 pub mod geometry;
 pub mod identify;
+mod look;
 pub mod media;
 pub mod output;
 pub mod output_layer;
@@ -191,6 +192,7 @@ pub use encode::Encoder;
 pub use error::{Error, Result};
 pub use frame::{Frame, FramePool, PixelFormat};
 pub use geometry::{Fit, Point, Quad, Rect};
+pub use look::{ChromaKey, Look};
 pub use identify::{identify_bytes, identify_path, Container, Encoding};
 pub use media::{MediaInfo, Packet, TrackInfo, TrackKind};
 pub use output::Output;
